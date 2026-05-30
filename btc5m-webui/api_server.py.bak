@@ -1,0 +1,829 @@
+#!/usr/bin/env python3
+import json, time, sys, subprocess, requests, os
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+from urllib.parse import parse_qs, urlparse
+
+BASE = Path(r"/mnt/c/Users/yyq/Desktop/自动交易")
+W = BASE / "btc5m-webui"
+STATIC_DIR = W / "dist"
+if not STATIC_DIR.exists():
+    STATIC_DIR = W
+T = BASE / "btc5m-trader"
+D = BASE / "btc5m数据"
+TRUE_DIR = D / "true_market"
+RUNTIME = BASE / "runtime"
+EVENTS_FILE = RUNTIME / "backend_events.jsonl"
+CN = timezone(timedelta(hours=8))
+LC = T / "live" / "config.json"
+SC = T / "sim" / "config.json"
+POLYGON_RPC = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+POLYGONSCAN = "https://polygonscan.com"
+PUSD_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+if str(T) not in sys.path: sys.path.insert(0, str(T))
+LH = {"ok": False}; LH_at = 0.0
+PRICE_CACHE = {"value": 0.0, "at": 0.0, "source": ""}
+PLATFORM_PRICE_CACHE = {}
+
+def rj(p):
+    if not p.exists(): return {}
+    try:
+        return json.load(open(p, encoding="utf-8-sig"))
+    except Exception:
+        return {}
+def wj(p, d): json.dump(d, open(p,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+def last_jsonl(p):
+    if not p.exists(): return {}
+    try:
+        r = subprocess.run(["tail","-n","1",str(p)], capture_output=True, text=True, timeout=3)
+        line = r.stdout.strip()
+        return json.loads(line) if line else {}
+    except Exception:
+        return {}
+
+def count_lines(p):
+    if not p.exists(): return 0
+    try:
+        r = subprocess.run(["wc","-l",str(p)], capture_output=True, text=True, timeout=3)
+        return int((r.stdout.strip().split() or ["0"])[0])
+    except Exception:
+        return 0
+
+def data_quality_state():
+    q = last_jsonl(TRUE_DIR / "data_quality.jsonl")
+    price = last_jsonl(TRUE_DIR / "price_ticks.jsonl")
+    book = last_jsonl(TRUE_DIR / "orderbook_ticks.jsonl")
+    stats = q.get("stats", {}) if isinstance(q.get("stats"), dict) else {}
+    if not q:
+        return {
+            "collector_running": svc("btc5m-collector"),
+            "current_window_quality": "missing",
+            "message": "暂未发现真实数据采集状态",
+            "stats": {},
+        }
+    try:
+        updated = datetime.fromisoformat(str(q.get("received_at","")).replace("Z","+00:00"))
+        age_ms = max(0, int((datetime.now(timezone.utc) - updated).total_seconds() * 1000))
+    except Exception:
+        age_ms = None
+    quality = q.get("current_window_quality","missing")
+    remaining = int(q.get("remaining_seconds") or 0)
+    official_price_age = iso_age_seconds(price.get("received_at"))
+    if age_ms is not None and age_ms > 120_000:
+        quality = "stale"
+    elif remaining < -30:
+        quality = "stale"
+    elif official_price_age is not None and official_price_age > 15 and quality == "good":
+        quality = "degraded"
+    display_price = latest_display_price()
+    return {
+        **q,
+        "collector_running": bool(q.get("collector_running")) and (svc("btc5m-collector") or age_ms is None or age_ms < 90_000),
+        "current_window_quality": quality,
+        "rtds_degraded": bool(q.get("rtds_degraded")) or (official_price_age is not None and official_price_age > 15),
+        "status_age_ms": age_ms,
+        "price_last_value": display_price.get("value", price.get("value", 0)),
+        "price_last_source": display_price.get("source", price.get("source", "")),
+        "official_price_age_seconds": round(official_price_age, 1) if official_price_age is not None else None,
+        "display_price_fallback": bool(display_price.get("display_fallback")),
+        "orderbook_last_reason": book.get("reason", book.get("event_type", "")),
+        "line_counts": {
+            "data_quality": count_lines(TRUE_DIR / "data_quality.jsonl"),
+            "price_ticks": count_lines(TRUE_DIR / "price_ticks.jsonl"),
+            "orderbook_ticks": count_lines(TRUE_DIR / "orderbook_ticks.jsonl"),
+            "trade_ticks": count_lines(TRUE_DIR / "trade_ticks.jsonl"),
+            "market_meta": count_lines(TRUE_DIR / "market_meta.jsonl"),
+            "resolutions": count_lines(TRUE_DIR / "resolutions.jsonl"),
+        },
+        "stats": stats,
+    }
+
+def parse_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def iso_age_seconds(value):
+    try:
+        dt = datetime.fromisoformat(str(value or "").replace("Z","+00:00"))
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+    except Exception:
+        return None
+
+def iso_utc(ts):
+    try:
+        return datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return ""
+
+def tail_jsonl(path, n=200):
+    if not path.exists(): return []
+    rows = []
+    try:
+        r = subprocess.run(["tail","-n",str(n),str(path)], capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line: continue
+            try: rows.append(json.loads(line))
+            except Exception: pass
+    except Exception:
+        pass
+    return rows
+
+def latest_true_window():
+    for row in reversed(tail_jsonl(TRUE_DIR / "windows.jsonl", 300)):
+        if row.get("source") == "polymarket_gamma" and row.get("window_start_ts"):
+            return row
+    return {}
+
+def latest_platform_validation(slug):
+    for row in reversed(tail_jsonl(TRUE_DIR / "windows.jsonl", 300)):
+        if row.get("source") == "platform_validation" and row.get("slug") == slug:
+            return row
+    return {}
+
+def latest_orderbook(slug):
+    changes = {}
+    for row in reversed(tail_jsonl(TRUE_DIR / "price_change_ticks.jsonl", 800)):
+        if slug and row.get("slug") != slug:
+            continue
+        side = str(row.get("side","")).lower()
+        if side in ("up", "down") and side not in changes:
+            changes[side] = {
+                "bid1_price": parse_float(row.get("best_bid",0)),
+                "ask1_price": parse_float(row.get("best_ask",0)),
+                "bids": [{"price": parse_float(row.get("best_bid",0)), "size": 0}],
+                "asks": [{"price": parse_float(row.get("best_ask",0)), "size": 0}],
+                "received_at": row.get("received_at",""),
+            }
+        if "up" in changes and "down" in changes:
+            return {"source": "polymarket_clob_ws", "reason": "price_change", "slug": slug, **changes}
+
+    fallback = {}
+    for row in reversed(tail_jsonl(TRUE_DIR / "orderbook_ticks.jsonl", 500)):
+        if slug and row.get("slug") != slug:
+            continue
+        fallback = fallback or row
+        up = row.get("up", {}) if isinstance(row.get("up"), dict) else {}
+        down = row.get("down", {}) if isinstance(row.get("down"), dict) else {}
+        if up.get("bids") or up.get("asks") or down.get("bids") or down.get("asks"):
+            return row
+    return fallback
+
+def side_prices(side):
+    bids = side.get("bids", []) if isinstance(side, dict) else []
+    asks = side.get("asks", []) if isinstance(side, dict) else []
+    bid = parse_float(side.get("bid1_price",0)) if isinstance(side, dict) else 0
+    ask = parse_float(side.get("ask1_price",0)) if isinstance(side, dict) else 0
+    if bid <= 0 and bids:
+        bid = parse_float((bids[0] or {}).get("price",0))
+    if ask <= 0 and asks:
+        ask = parse_float((asks[0] or {}).get("price",0))
+    mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else ask or bid or 0
+    return {"bid": bid, "ask": ask, "mid": mid}
+
+def latest_display_price():
+    global PRICE_CACHE
+    price = last_jsonl(TRUE_DIR / "price_ticks.jsonl")
+    value = parse_float(price.get("value",0))
+    official_age = iso_age_seconds(price.get("received_at"))
+    if value and official_age is not None and official_age <= 10:
+        return {**price, "value": value, "age_seconds": round(official_age, 1), "display_fallback": False}
+
+    now = time.time()
+    if PRICE_CACHE.get("value") and now - PRICE_CACHE.get("at", 0) <= 2:
+        return {
+            "value": PRICE_CACHE["value"],
+            "source": PRICE_CACHE["source"],
+            "age_seconds": round(now - PRICE_CACHE["at"], 1),
+            "official_age_seconds": round(official_age, 1) if official_age is not None else None,
+            "display_fallback": True,
+        }
+
+    for url, source in [
+        ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "binance_display_fallback"),
+        ("https://api.coinbase.com/v2/prices/BTC-USD/spot", "coinbase_display_fallback"),
+        ("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", "kraken_display_fallback"),
+    ]:
+        try:
+            r = requests.get(url, timeout=3)
+            data = r.json()
+            if source.startswith("binance"):
+                v = parse_float(data.get("price"))
+            elif source.startswith("coinbase"):
+                v = parse_float(((data.get("data") or {}).get("amount")))
+            else:
+                ticker = ((data.get("result") or {}).get("XXBTZUSD") or {})
+                v = parse_float((ticker.get("c") or [0])[0])
+            if v:
+                PRICE_CACHE = {"value": v, "at": now, "source": source}
+                return {
+                    "value": v,
+                    "source": source,
+                    "age_seconds": 0.0,
+                    "official_age_seconds": round(official_age, 1) if official_age is not None else None,
+                    "display_fallback": True,
+                }
+        except Exception:
+            pass
+    return {**price, "value": value, "age_seconds": round(official_age or 0, 1), "display_fallback": False}
+
+def platform_crypto_price(symbol, start_ts, end_ts, variant="fiveminute"):
+    """Read the same crypto open/close price endpoint used by the Polymarket page."""
+    global PLATFORM_PRICE_CACHE
+    if not start_ts or not end_ts:
+        return {}
+    key = (symbol.upper(), int(start_ts), int(end_ts), variant)
+    now = time.time()
+    cached = PLATFORM_PRICE_CACHE.get(key)
+    if cached and now - cached.get("at", 0) < 10:
+        return cached.get("data", {})
+    try:
+        params = {
+            "symbol": symbol.upper(),
+            "eventStartTime": iso_utc(start_ts),
+            "variant": variant,
+            "endDate": iso_utc(end_ts),
+        }
+        r = requests.get(
+            "https://polymarket.com/api/crypto/crypto-price",
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return cached.get("data", {}) if cached else {}
+        data = r.json()
+        result = {
+            "open_price": parse_float(data.get("openPrice", 0)),
+            "close_price": parse_float(data.get("closePrice", 0), None),
+            "timestamp": data.get("timestamp"),
+            "completed": bool(data.get("completed")),
+            "incomplete": bool(data.get("incomplete")),
+            "cached": bool(data.get("cached")),
+            "source": "polymarket_crypto_price_api",
+        }
+        PLATFORM_PRICE_CACHE[key] = {"at": now, "data": result}
+        return result
+    except Exception:
+        return cached.get("data", {}) if cached else {}
+
+def true_market_snapshot():
+    w = latest_true_window()
+    if not w: return {}
+    slug = w.get("slug","")
+    price = latest_display_price()
+    q = data_quality_state()
+    ob = latest_orderbook(slug)
+    up = side_prices(ob.get("up", {}) if isinstance(ob.get("up"), dict) else {})
+    down = side_prices(ob.get("down", {}) if isinstance(ob.get("down"), dict) else {})
+    val = latest_platform_validation(slug)
+    start = int(w.get("window_start_ts") or 0)
+    end = int(w.get("window_end_ts") or 0)
+    now = int(time.time())
+    price_value = parse_float(price.get("value",0))
+    platform_price = platform_crypto_price("BTC", start, end)
+    platform_open = parse_float(platform_price.get("open_price",0))
+    raw_ptb = parse_float(w.get("ptb",0))
+    raw_quality = str(w.get("ptb_quality","") or "")
+    official_age = price.get("official_age_seconds")
+    if platform_open:
+        ptb = platform_open
+        ptb_source = platform_price.get("source","polymarket_crypto_price_api")
+        ptb_quality = "platform"
+        exclude_from_backtest = False
+    elif raw_ptb and raw_quality in ("exact", "close"):
+        ptb = raw_ptb
+        ptb_source = w.get("ptb_source","")
+        ptb_quality = raw_quality
+        exclude_from_backtest = bool(w.get("exclude_from_backtest", False))
+    else:
+        ptb = 0
+        ptb_source = "missing_platform_open_price"
+        ptb_quality = "missing"
+        exclude_from_backtest = True
+    return {
+        "slug": slug,
+        "window_start_ts": start,
+        "window_end_ts": end,
+        "seconds_left": max(0, end - now) if end else 0,
+        "ptb": ptb,
+        "open_price": ptb,
+        "raw_collector_ptb": raw_ptb,
+        "ptb_source": ptb_source,
+        "ptb_quality": ptb_quality,
+        "platform_ptb": platform_open or parse_float(val.get("platform_ptb", w.get("platform_ptb", 0))),
+        "platform_close_price": platform_price.get("close_price"),
+        "ptb_diff": round(abs(raw_ptb - platform_open), 2) if raw_ptb and platform_open else parse_float(val.get("diff", 0)),
+        "exclude_from_backtest": exclude_from_backtest,
+        "btc_price": price_value,
+        "chainlink_price": price_value,
+        "gap": round(price_value - ptb, 2) if price_value and ptb else 0,
+        "up_price": up["mid"],
+        "down_price": down["mid"],
+        "up_bid": up["bid"],
+        "up_ask": up["ask"],
+        "down_bid": down["bid"],
+        "down_ask": down["ask"],
+        "source": price.get("source",""),
+        "data_age_seconds": price.get("age_seconds", round((q.get("status_age_ms") or 0) / 1000, 1)),
+        "official_price_age_seconds": price.get("official_age_seconds"),
+        "display_fallback": bool(price.get("display_fallback")),
+    }
+def mask(a):
+    return f"{a[:8]}...{a[-6:]}" if isinstance(a,str) and len(a)>14 else (a or "")
+
+def env_file():
+    out = {}
+    fp = T / ".env"
+    if not fp.exists(): return out
+    for line in fp.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+def rpc(method, params):
+    try:
+        r = requests.post(POLYGON_RPC, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=8)
+        data = r.json()
+        if "error" in data: return None
+        return data.get("result")
+    except Exception:
+        return None
+
+def erc20_balance(token, owner):
+    if not owner or not owner.startswith("0x") or len(owner) != 42: return None
+    data = "0x70a08231" + owner[2:].lower().rjust(64, "0")
+    res = rpc("eth_call", [{"to": token, "data": data}, "latest"])
+    try: return int(res or "0x0", 16)
+    except Exception: return None
+
+def native_balance(owner):
+    res = rpc("eth_getBalance", [owner, "latest"]) if owner else None
+    try: return int(res or "0x0", 16)
+    except Exception: return None
+
+def contract_deployed(owner):
+    code = rpc("eth_getCode", [owner, "latest"]) if owner else None
+    return bool(code and code != "0x")
+
+def usd6(v):
+    try: return round(int(v) / 1_000_000, 6)
+    except Exception: return 0.0
+
+def poly_tx(tx):
+    return f"{POLYGONSCAN}/tx/{tx}" if isinstance(tx, str) and tx.startswith("0x") and len(tx) == 66 else ""
+
+def poly_addr(addr):
+    return f"{POLYGONSCAN}/address/{addr}" if isinstance(addr, str) and addr.startswith("0x") and len(addr) == 42 else ""
+
+def backend_events(limit=50):
+    if not EVENTS_FILE.exists(): return []
+    rows = []
+    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                item = json.loads(line)
+                item["tx_url"] = poly_tx(item.get("tx_hash",""))
+                rows.append(item)
+            except Exception:
+                pass
+    rows.reverse()
+    return rows[:limit]
+
+def wallet_state():
+    env = env_file()
+    ch = clh()
+    funder = env.get("FUNDER_ADDRESS") or env.get("POLYMARKET_FUNDER_ADDRESS") or ""
+    bal = ch.get("balance_allowance", {}) if isinstance(ch.get("balance_allowance"), dict) else {}
+    allowances = bal.get("allowances", {}) if isinstance(bal.get("allowances"), dict) else {}
+    allowance_ready = bool(allowances) and all(str(v) != "0" for v in allowances.values())
+    pbal = erc20_balance(PUSD_TOKEN, funder)
+    nbal = native_balance(funder)
+    last_order = next((e for e in backend_events(20) if e.get("type") == "order"), None)
+    return {
+        "route": "后端自动下单（不用浏览器）",
+        "network": "Polygon",
+        "chain_id": 137,
+        "polygonscan": POLYGONSCAN,
+        "pUSD_token": PUSD_TOKEN,
+        "pUSD_token_url": poly_addr(PUSD_TOKEN),
+        "deposit_wallet": funder,
+        "deposit_wallet_short": mask(funder),
+        "deposit_wallet_url": poly_addr(funder),
+        "signer": ch.get("address", ""),
+        "signature_type": ch.get("signature_type"),
+        "builder_key_present": bool(env.get("BUILDER_API_KEY")),
+        "clob_ok": bool(ch.get("ok")),
+        "clob_balance": usd6(bal.get("balance", 0)),
+        "allowance_ready": allowance_ready,
+        "allowance_count": len(allowances),
+        "chain_pUSD_balance": usd6(pbal or 0),
+        "native_pol": round((nbal or 0) / 10**18, 8),
+        "wallet_deployed": contract_deployed(funder),
+        "last_order": last_order,
+        "events": backend_events(12),
+    }
+
+def svc(n):
+    try:
+        r = subprocess.run(["systemctl","--user","is-active",n],capture_output=True,text=True,timeout=3)
+        return r.stdout.strip()=="active"
+    except: return False
+
+def brd():
+    for h in ["http://172.18.16.1:8789/status","http://localhost:8789/status"]:
+        try:
+            r = requests.get(h, timeout=2)
+            if r.status_code==200 and r.json().get("ready"): return True
+        except: pass
+    return False
+
+def clh():
+    global LH, LH_at
+    now = time.time()
+    if LH.get("ok") and now-LH_at<10: return LH
+    try:
+        import clob_executor
+        LH = clob_executor.health(check_auth=True); LH_at=now; return LH
+    except Exception as e:
+        LH = {"executor":"clob_sdk","ok":False,"error":str(e)[:300]}; LH_at=now; return LH
+
+def read_trades():
+    fp = D / "trades.jsonl"
+    if not fp.exists(): return []
+    trades = []
+    with open(fp,"r",encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try: trades.append(json.loads(line))
+                except: pass
+    return trades
+
+def normalize_stats(d):
+    d = d if isinstance(d, dict) else {}
+    trades = int(d.get("trade_count") or 0)
+    wins = int(d.get("win_count") or 0)
+    losses = int(d.get("loss_count") or 0)
+    return {
+        "bankroll": float(d.get("bankroll") or 0),
+        "trade_count": trades,
+        "win_count": wins,
+        "loss_count": losses,
+        "total_withdrawn": float(d.get("total_withdrawn") or 0),
+        "win_rate": round((wins / trades) * 100, 2) if trades else 0.0,
+    }
+
+def trading_stats():
+    state = rj(D / "sim" / "state.json")
+    legacy = rj(D / "trader_state.json")
+    sim = normalize_stats(state.get("sim_state") or legacy)
+    live = normalize_stats(state.get("live_state") or rj(D / "live" / "state.json"))
+    total_trades = sim["trade_count"] + live["trade_count"]
+    total_wins = sim["win_count"] + live["win_count"]
+    total_losses = sim["loss_count"] + live["loss_count"]
+    total = {
+        "bankroll": round(sim["bankroll"] + live["bankroll"], 6),
+        "trade_count": total_trades,
+        "win_count": total_wins,
+        "loss_count": total_losses,
+        "total_withdrawn": round(sim["total_withdrawn"] + live["total_withdrawn"], 6),
+        "win_rate": round((total_wins / total_trades) * 100, 2) if total_trades else 0.0,
+    }
+    return {"sim": sim, "live": live, "total": total}
+
+def daily_summary(trades):
+    daily = defaultdict(lambda: {"trades":0,"pnl":0.0,"wins":0,"losses":0,"skipped":0,"volume":0.0})
+    for t in trades:
+        ts = t.get("time","")
+        try:
+            dt = datetime.fromisoformat(ts).astimezone(CN); day = dt.strftime("%m-%d")
+        except: day = "unknown"
+        d = daily[day]; d["trades"]+=1
+        d["volume"] += abs(float(t.get("buy_amount",0)))
+        pnl = float(t.get("net_profit",0)); d["pnl"] += pnl
+        if t.get("won"): d["wins"]+=1
+        elif t.get("status")=="skipped": d["skipped"]+=1
+        else: d["losses"]+=1
+    return [{"date":k,"trades":v["trades"],"pnl":round(v["pnl"],2),
+             "wins":v["wins"],"losses":v["losses"],"skipped":v["skipped"],
+             "volume":round(v["volume"],2)}
+            for k,v in sorted(daily.items(),reverse=True)]
+
+class H(SimpleHTTPRequestHandler):
+    def __init__(self,*a,**kw):
+        super().__init__(*a,directory=str(STATIC_DIR),**kw)
+    def j(self,d,s=200):
+        b = json.dumps(d,ensure_ascii=False).encode("utf-8")
+        self.send_response(s)
+        self.send_header("Content-Type","application/json; charset=utf-8")
+        self.send_header("Content-Length",str(len(b)))
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.end_headers()
+        try: self.wfile.write(b)
+        except BrokenPipeError: pass
+    def do_GET(self):
+        p = self.path
+        if p=="/api/config": self.j(rj(T/"config.json"))
+        elif p=="/api/trader": self.j(rj(D/"trader_state.json"))
+        elif p=="/api/safety": self.do_safety()
+        elif p=="/api/status": self.do_status()
+        elif p=="/api/summary": self.do_summary()
+        elif p=="/api/performance": self.do_summary()
+        elif p=="/api/live": self.j(rj(LC))
+        elif p=="/api/sim": self.j(rj(SC))
+        elif p=="/api/clob-health": self.j(clh())
+        elif p=="/api/wallet": self.j(wallet_state())
+        elif p=="/api/data-quality": self.j(data_quality_state())
+        elif p.startswith("/api/backend-events"): self.j({"events": backend_events(50)})
+        elif p=="/api/strategies":
+            cfg = rj(T/"config.json")
+            self.j({"active_strategy": cfg.get("active_strategy","1"), "strategies": cfg.get("strategies",{})})
+        elif p=="/api/markets": self.do_markets()
+        elif p.startswith("/api/trades"): self.do_trades()
+        elif p=="/api/daily-detail": self.do_daily_detail()
+        else:
+            if "." not in Path(p.split("?",1)[0]).name:
+                self.path = "/index.html"
+            super().do_GET()
+    def do_POST(self):
+        p = self.path
+        try: b = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+        except: b={}
+        if p=="/api/config": self.up_config(b)
+        elif p=="/api/toggle": self.toggle(b)
+        elif p=="/api/live/arm": self.arm(b)
+        elif p=="/api/strategies/switch": self.switch_strat(b)
+        elif p=="/api/strategies/update": self.up_strat(b)
+        elif p=="/api/sim/funds": self.set_sim_funds(b)
+        elif p=="/api/reset": self.reset()
+        elif p=="/api/refresh": self.refresh()
+        else: self.j({"error":"not found"},404)
+    def do_safety(self):
+        br=brd(); sa=svc("btc5m-live"); ss=svc("btc5m-sim")
+        lc=rj(LC); pa=lc.get("paused",True); ar=lc.get("armed",False)
+        sc=rj(SC); sp=sc.get("paused",False)
+        cfg=rj(T/"config.json"); md=cfg.get("mode","sim")
+        ch=clh()
+        bal = ch.get("balance_allowance", {}) if isinstance(ch.get("balance_allowance"), dict) else {}
+        route_ready = bool(ch.get("ok") and ch.get("signature_type")==3 and usd6(bal.get("balance",0)) >= 1)
+        self.j({"asset_scope":["BTC 5M"],"executor":"backend_deposit_wallet" if route_ready else "clob_sdk",
+            "confirm_text":"BTC5M-LIVE","service_active":sa,"sim_active":ss,
+            "browser_ready":br,"clob_ready":ch.get("ok",False),
+            "clob_health":ch,"armed":ar,"paused":pa,"sim_paused":sp,
+            "mode":md,"ready_to_trade":ar and not pa and route_ready and sa,
+            "live_connected":route_ready,"route_ready":route_ready,
+            "sim_trading":not sp and ss,"max_live_amount":1.0,
+            "checks":[
+                {"name":"实盘服务","ok":sa},
+                {"name":"模拟服务","ok":ss},
+                {"name":"实盘钱包可下单","ok":route_ready},
+                {"name":"交易接口可用","ok":ch.get("ok",False)}]})
+    def do_status(self):
+        cfg=rj(T/"config.json"); md=cfg.get("mode","sim")
+        lsa=svc("btc5m-live"); ssa=svc("btc5m-sim"); ca=svc("btc5m-collector")
+        ticker={}; market={}
+
+        true_snap = true_market_snapshot()
+        if true_snap:
+            market = {
+                "slug": true_snap.get("slug",""),
+                "window_start_ts": true_snap.get("window_start_ts",0),
+                "window_end_ts": true_snap.get("window_end_ts",0),
+                "seconds_left": true_snap.get("seconds_left",0),
+                "ptb_quality": true_snap.get("ptb_quality",""),
+                "ptb_diff": true_snap.get("ptb_diff",0),
+                "exclude_from_backtest": true_snap.get("exclude_from_backtest",False),
+            }
+            ticker = {
+                "btc_price": true_snap.get("btc_price",0),
+                "chainlink_price": true_snap.get("chainlink_price",0),
+                "ptb": true_snap.get("ptb",0),
+                "open_price": true_snap.get("open_price",0),
+                "platform_ptb": true_snap.get("platform_ptb",0),
+                "gap": true_snap.get("gap",0),
+                "up_price": true_snap.get("up_price",0),
+                "down_price": true_snap.get("down_price",0),
+                "up_bid": true_snap.get("up_bid",0),
+                "up_ask": true_snap.get("up_ask",0),
+                "down_bid": true_snap.get("down_bid",0),
+                "down_ask": true_snap.get("down_ask",0),
+                "source": true_snap.get("source",""),
+                "ptb_source": true_snap.get("ptb_source",""),
+                "ptb_quality": true_snap.get("ptb_quality",""),
+                "data_age_seconds": true_snap.get("data_age_seconds",0),
+                "official_price_age_seconds": true_snap.get("official_price_age_seconds"),
+                "display_fallback": true_snap.get("display_fallback", False),
+            }
+
+        # 回退：从旧文件读取
+        if not ticker.get("btc_price"):
+            try:
+                ts=rj(D/"trader_state.json")
+                if ts.get("current_market"): market.update(ts["current_market"])
+                if ts.get("ticker"): ticker.update(ts["ticker"])
+            except: pass
+        if not ticker.get("btc_price"):
+            try:
+                tail=subprocess.run(["tail","-n","1",str(D/"btc_price.jsonl")],capture_output=True,text=True,timeout=3)
+                if tail.stdout.strip():
+                    tp=json.loads(tail.stdout.strip())
+                    ticker["btc_price"]=tp.get("btc_price",0)
+                    ticker["chainlink_price"]=tp.get("chainlink_price",0)
+                    ticker["ptb"]=tp.get("ptb",tp.get("price_to_beat",0)); ticker["gap"]=tp.get("gap",0)
+                    ticker["up_price"]=tp.get("up_price",0); ticker["down_price"]=tp.get("down_price",0)
+                    ticker["source"]=tp.get("market_data_source",""); ticker["data_age_seconds"]=tp.get("age",99)
+            except: pass
+        if not market.get("slug"):
+            try:
+                ev=subprocess.run(["tail","-n","1",str(D/"all_events.jsonl")],capture_output=True,text=True,timeout=3)
+                if ev.stdout.strip():
+                    e=json.loads(ev.stdout.strip())
+                    market["slug"]=e.get("slug",""); market["seconds_left"]=e.get("seconds_left",300)
+                    market["close_time"]=e.get("close_time","")
+            except: pass
+        stats = trading_stats()
+        ts = stats["sim"] or rj(D/"trader_state.json")
+        self.j({"sim":{"service_active":ssa},"live":{"service_active":lsa},"collector":{"service_active":ca},
+            "current_market":market,"ticker":ticker,"executor_mode":md,
+            "stats": stats,
+            "trader_state":{"bankroll":ts.get("bankroll",0),"trade_count":ts.get("trade_count",0),
+                "win_count":ts.get("win_count",0),"loss_count":ts.get("loss_count",0),
+                "total_withdrawn":ts.get("total_withdrawn",0)}})
+    def do_summary(self):
+        trades=read_trades()
+        total=len(trades); won=sum(1 for t in trades if t.get("won"))
+        lost=sum(1 for t in trades if not t.get("won") and t.get("status")=="matched")
+        skipped=sum(1 for t in trades if t.get("status")=="skipped")
+        failed=sum(1 for t in trades if t.get("status")=="failed")
+        total_pnl=round(sum(float(t.get("net_profit",0)) for t in trades if t.get("net_profit")),2)
+        self.j({"total":total,"won":won,"lost":lost,"skipped":skipped,"failed":failed,
+            "total_pnl":total_pnl,"daily_summary":daily_summary(trades)})
+    def do_trades(self):
+        p=self.path; page=1; pp=20
+        if "?" in p:
+            qs=p.split("?",1)[1]
+            for kv in qs.split("&"):
+                if "=" in kv:
+                    k,v=kv.split("=",1)
+                    if k=="p": page=max(1,int(v))
+                    elif k=="ps": pp=min(100,max(1,int(v)))
+        all_trades=read_trades(); all_trades.reverse()
+        total=len(all_trades)
+        if total>100: all_trades=all_trades[:100]; total=100
+        pages=max(1,(total+pp-1)//pp)
+        if page>pages: page=pages
+        start=(page-1)*pp; end=min(start+pp,total)
+        page_trades=all_trades[start:end]
+        fmt=[]
+        for t in page_trades:
+            st=t.get("status",""); won=t.get("won",False)
+            if st=="skipped": ds="skipped"
+            elif st=="failed": ds="failed"
+            elif won: ds="won"
+            else: ds="matched_lost"
+            d=str(t.get("direction","none")).lower()
+            if d not in ("up","down"): d="none"
+            amt=float(t.get("buy_amount",0)); pnl=float(t.get("net_profit",0))
+            eg=t.get("entry_gap",t.get("gap",0)); sg=float(t.get("gap",0))
+            ret=round(pnl/amt*100,2) if amt>0 else 0.0
+            tx = t.get("tx_hash",t.get("transaction_hash",t.get("hash","")))
+            fmt.append({"status":ds,"time":t.get("time",""),"direction":d,
+                "slug":t.get("slug",""),"btc_open":float(t.get("ptb",0)),
+                "btc_entry":float(t.get("btc_entry",0)),"btc_final":float(t.get("btc_final",0)),
+                "entry_gap":round(float(eg),2),"settle_gap":round(float(sg),2),
+                "buy_prob":float(t.get("buy_prob",0)),"buy_amount":amt,
+                "net_profit":pnl,"return_pct":ret,
+                "skip_reason":t.get("skip_reason",""),
+                "executor":t.get("executor",""),
+                "order_id":t.get("orderID",t.get("order_id","")),
+                "tx_hash":tx,"tx_url":poly_tx(tx)})
+        self.j({"trades":fmt,"total":total,"page":page,"pages":pages,"per_page":pp})
+    def do_daily_detail(self):
+        trades=read_trades()
+        daily=defaultdict(list)
+        for t in trades:
+            ts=t.get("time","")
+            try: dt=datetime.fromisoformat(ts).astimezone(CN); day=dt.strftime("%Y-%m-%d")
+            except: day="unknown"
+            d=str(t.get("direction","none")).lower()
+            if d not in ("up","down"): d="none"
+            st=t.get("status",""); won=t.get("won",False)
+            if st=="skipped": ds="skipped"
+            elif st=="failed": ds="failed"
+            elif won: ds="won"
+            else: ds="lost"
+            amt=float(t.get("buy_amount",0)); pnl=float(t.get("net_profit",0))
+            eg=t.get("entry_gap",t.get("gap",0)); sg=float(t.get("gap",0))
+            ret=round(pnl/amt*100,2) if amt>0 else 0.0
+            tx = t.get("tx_hash",t.get("transaction_hash",t.get("hash","")))
+            daily[day].append({"status":ds,"time":t.get("time",""),"direction":d,
+                "slug":t.get("slug",""),"btc_entry":float(t.get("btc_entry",0)),
+                "btc_final":float(t.get("btc_final",0)),
+                "entry_gap":round(float(eg),2),"settle_gap":round(float(sg),2),
+                "buy_prob":float(t.get("buy_prob",0)),"buy_amount":amt,
+                "net_profit":pnl,"return_pct":ret,"skip_reason":t.get("skip_reason",""),
+                "executor":t.get("executor",""),"order_id":t.get("orderID",t.get("order_id","")),
+                "tx_hash":tx,"tx_url":poly_tx(tx)})
+        result=[{"date":k,"trades":v} for k,v in sorted(daily.items(),reverse=True)]
+        self.j(result)
+    def up_config(self,b):
+        cfg=rj(T/"config.json")
+        if "mode" in b: cfg["mode"]=b["mode"]
+        if "paused" in b: cfg["paused"]=b["paused"]
+        wj(T/"config.json",cfg); self.j({"ok":True})
+    def toggle(self,b):
+        act=b.get("action","start"); mode=b.get("mode","sim")
+        if mode == "live" and act == "start":
+            lc=rj(LC); lc["paused"]=True; lc["armed"]=False; wj(LC,lc)
+            self.j({"error":"实盘单笔下单已经验证成功；自动循环还没有接进主程序，所以系统保持实盘暂停，避免继续真实下注。"},409); return
+        fp = SC if mode == "sim" else LC
+        cfg=rj(fp); cfg["paused"]=(act=="pause")
+        if mode == "live":
+            cfg["armed"] = False
+        wj(fp,cfg)
+        root=rj(T/"config.json"); root["mode"]=mode; root["paused"]=cfg.get("paused",True); wj(T/"config.json",root)
+        self.j({"ok":True,"status":act,"mode":mode,"paused":cfg.get("paused",True)})
+    def arm(self,b):
+        ar=b.get("armed",False); lc=rj(LC)
+        if ar:
+            if b.get("confirm","")!="BTC5M-LIVE":
+                self.j({"error":"确认码错误"},400); return
+            lc["armed"]=True; lc["paused"]=False
+            lc["max_live_amount"]=float(b.get("max_live_amount",1))
+        else: lc["armed"]=False; lc["paused"]=True
+        wj(LC,lc); self.j({"ok":True})
+    def switch_strat(self,b):
+        sid=b.get("strategy_id","1")
+        for fp in [LC,SC,T/"config.json"]:
+            cfg=rj(fp); cfg["active_strategy"]=sid; wj(fp,cfg)
+        self.j({"ok":True,"strategy":sid})
+    def up_strat(self,b):
+        sid=b.get("strategy_id","1"); params=b.get("params",{}); name=b.get("name","")
+        for fp in [LC,SC,T/"config.json"]:
+            cfg=rj(fp)
+            if sid in cfg.get("strategies",{}):
+                for k,v in params.items(): cfg["strategies"][sid]["params"][k]=v
+                if name: cfg["strategies"][sid]["name"]=name
+                wj(fp,cfg)
+        self.j({"ok":True})
+    def set_sim_funds(self,b):
+        try:
+            amount = float(b.get("amount"))
+        except Exception:
+            self.j({"error":"模拟资金必须是数字"},400); return
+        if amount < 1 or amount > 1000000:
+            self.j({"error":"模拟资金范围必须在 1 到 1,000,000 之间"},400); return
+
+        for fp in [SC, T / "config.json"]:
+            cfg = rj(fp)
+            cfg["initial_capital"] = amount
+            wj(fp, cfg)
+
+        state_fp = D / "sim" / "state.json"
+        state = rj(state_fp)
+        sim_state = state.get("sim_state") if isinstance(state.get("sim_state"), dict) else {}
+        sim_state["bankroll"] = amount
+        state["sim_state"] = sim_state
+        state["last_update"] = datetime.now(CN).isoformat()
+        state.setdefault("config", {})["initial_capital"] = amount
+        wj(state_fp, state)
+        self.j({"ok":True,"amount":amount,"stats":trading_stats()})
+    def reset(self): self.j({"ok":True})
+    def refresh(self):
+        global LH_at
+        LH_at = 0.0
+        self.j({"ok":True})
+    def do_markets(self):
+        fp = D / "markets.jsonl"
+        if not fp.exists(): self.j([]); return
+        mkts = []
+        try:
+            r = subprocess.run(["tail","-n","200",str(fp)], capture_output=True,text=True,timeout=3)
+            for line in r.stdout.strip().split("\n"):
+                if line.strip():
+                    try: mkts.append(json.loads(line))
+                    except: pass
+        except: pass
+        self.j(mkts)
+    def log_message(self,fmt,*a):
+        if a and "200" not in str(a[1] if len(a)>1 else ""):
+            super().log_message(fmt,*a)
+
+class S(ThreadingMixIn,HTTPServer): daemon_threads=True
+
+if __name__=="__main__":
+    port=8877
+    s=S(("0.0.0.0",port),H)
+    print(f"API on http://0.0.0.0:{port}",flush=True)
+    try: s.serve_forever()
+    except KeyboardInterrupt: s.server_close()

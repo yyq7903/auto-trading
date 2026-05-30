@@ -1,0 +1,68 @@
+回测/模拟盘数据：我们采集的 vs 平台实际的
+一、核心价格数据
+字段	我们采集的	平台实际的	是否一致
+开盘价 (PTB)	Chainlink RPC getChainlinkData() 每秒读 0xfeaf968c	Polymarket 结算用 Chainlink BTC/USD Data Stream (https://data.chain.link/streams/btc-usd)	⚠️ 大部分一致，但有精度差
+BTC 实时价格	Chainlink latestRoundData() → /10^8 = 76620.817	平台显示的 BTC 价格	✅ 同源
+结算价 (btc_final)	未采集！ trades.jsonl 中 live 订单 btc_final=None	Polymarket 用 Chainlink Data Stream 在窗口结束时刻的价格结算	❌ 缺失
+gap 计算	btc_entry - ptb	平台无 gap 字段，但 winner 由 btc_final vs ptb 决定	⚠️ 我们的 gap 是入场时的，不是结算时的
+
+二、概率/价格数据
+字段	我们采集的	平台实际的	是否一致
+Up/Down 价格	CLOB WebSocket 推送 up_price, down_price	gamma API outcomePrices 字段	✅ 基本一致
+bestBid / bestAsk	CLOB WebSocket 推送	gamma API bestBid, bestAsk	✅ 一致
+orderbook 深度	CLOB REST /book snapshot	同	✅ 一致
+概率走势	未采集 — 没有逐秒存概率时间序列	gamma API 无历史概率；只有当前时刻的	❌ 缺失
+
+三、市场元数据
+字段	我们采集的	平台实际的	是否一致
+slug	btc-updown-5m-{ts}	gamma API slug 字段	✅ 一致
+token IDs	gamma API clobTokenIds (前10位可见)	gamma API 完整返回	✅ 一致
+market_id	gamma API id	同	✅ 一致
+volume	gamma API volume 字段	同	✅ 一致
+liquidity	gamma API liquidity	同	✅ 一致
+fee 结构	未采集	gamma API feeSchedule: {exponent:1, rate:0.07, takerOnly:true}	❌ 缺失
+spread	gamma API spread	同	✅ 一致
+negRisk	gamma API negRisk	同	✅ 一致
+
+四、结算结果
+字段	我们采集的	平台实际的	是否一致
+winner (Up/Down)	模拟盘通过 btc_final vs ptb 自行计算	Polymarket 用 UMA Oracle 结算（非 Chainlink！）	⚠️ 可能不一致
+actual_winner	trades.jsonl 中大部分为 None	gamma API 无此字段；需查 UMA Oracle	❌ 缺失
+结算 tx hash	CLOB response transactionsHashes	同	✅ 一致
+
+五、Chainlink 数据精度问题
+我们读 Chainlink 的方式：
+
+python复制
+answer = int(hex_data[64:128], 16) / 10**8  # → 76620.81700000
+Chainlink 返回的是 latestRoundData()，这是 Chainlink Feed 的聚合价格
+Polymarket 结算用的是 Chainlink Data Streams (data.chain.link/streams/btc-usd)，这是另一套 API，可能有微小价格差
+同一时刻两个价格可能差 
+0.5
+−
+0.5−2
+六、缺失字段（回测必须用到）
+字段	说明	为什么重要
+btc_final	窗口结束时的 BTC 精确价格	决定赢家，计算盈亏
+actual_winner	平台官方结算结果 (Up/Down)	验证我们的策略对不对
+fee_per_share	实际手续费	计算真实净盈亏
+settlement_source	是 Chainlink 还是 UMA Oracle	知道结算用哪个价格源
+概率时间序列	每秒的 Up/Down 概率	分析概率走势，优化入场时机
+成交价分布	历史成交价格的分布	分析滑点
+
+七、gamma API 能拿到但没采集的字段
+字段	gamma API	我们	用途
+outcomePrices	✅ 实时	❌	回测概率
+bestBid/bestAsk	✅ 实时	❌	滑点分析
+lastTradePrice	✅ 实时	❌	实际成交价
+orderMinSize	✅ 静态	❌	最低下单验证
+tickSize	✅ 静态	❌	价格精度
+feeSchedule	✅ 静态	❌	手续费计算
+resolutionSource	✅ 静态	❌	知道用哪个 Oracle
+events[].startTime	✅ 动态	❌	窗口开始时间
+
+需要 Codex 告诉我的：
+
+哪些缺失字段可以通过现有 API 直接补上？
+btc_final 怎么精确获取——是用 Chainlink 还是要查 UMA Oracle？
+actual_winner 怎么从平台拿到——是查 resolution 还是从 gamma API 的 closed market 状态推断？

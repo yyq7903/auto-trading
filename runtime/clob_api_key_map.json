@@ -1,0 +1,14 @@
+{
+  "0x67049B4dA0fa6A28b29DF82d21866EE128078bbE": {
+    "key": "2231d7bc-92ec-f16a-d3c8-8c7d5fe507b0",
+    "secret": "QrJuSgVDkUd9Jvh5snDURn0-4DPGL4L5kwKl23CVJN0=",
+    "passphrase": "338334ff4c8193d9eacd99d5fb95273899f662679337ff1781bf0852a7408d50",
+    "baseAddress": "0x679CC0C3eDEeB2141138E403Bc666275da8FaD37"
+  },
+  "0xd2Cb39A786Bc50F782a5B5C700cF7552a108cd64": {
+    "key": "5a20d369-9144-eedf-56b2-3de47db32b38",
+    "secret": "ivKHG7u60H0d1wxNh4BwBi51DwEf55XXDGXJ0gCPfMY=",
+    "passphrase": "8a8f4cad4e1ee64a627f9180d20f0ecd44bdacfd49a5e2172449c5a206911891",
+    "baseAddress": "0x8aa26B551B21f5DC02490c50f29Bc8820AdF1C2a"
+  }
+}

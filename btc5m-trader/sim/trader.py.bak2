@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""
+BTC 5M Sim Trader — 纯模拟，不连接浏览器/钱包
+完全隔离：独立 config / state / trades / logs
+"""
+import os, sys, json, time, threading
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from shared.utils import log, log_trade, CN
+from shared.config import Config
+from shared.btc_price import get_btc, get_btc_fresh, btc_price_loop, extract_tokens, find_market, fetch_platform_crypto_price
+
+# === 路径 ===
+MODE = "sim"
+TRADER_DIR = Path(__file__).parent
+DATA_DIR = Path(f"/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/{MODE}")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = DATA_DIR / "state.json"
+NOTIFY_FILE = DATA_DIR / "notify.txt"
+
+ROOT_TRADES = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/trades.jsonl")
+
+# === 共享数据（只读） ===
+COLLECTOR_DATA = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/shared")
+MARKETS_FILE = COLLECTOR_DATA / "markets.jsonl"
+TRUE_MARKET_DIR = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/true_market")
+WINDOWS_FILE = TRUE_MARKET_DIR / "windows.jsonl"
+
+# === 运行时状态 ===
+config = Config(str(TRADER_DIR))
+cfg = config.data
+bankroll = 100.0  # 模拟盘独立本金
+trade_count = 0
+win_count = 0
+loss_count = 0
+total_withdrawn = 0.0
+consecutive_losses = 0
+cooldown_until = 0
+btc_price = 0.0
+
+
+def load_state():
+    global bankroll, trade_count, win_count, loss_count, total_withdrawn, consecutive_losses, cooldown_until
+    state = config.load_state()
+    bankroll = state.get("bankroll", 100.0)
+    trade_count = state.get("trade_count", 0)
+    win_count = state.get("win_count", 0)
+    loss_count = state.get("loss_count", 0)
+    total_withdrawn = state.get("total_withdrawn", 0.0)
+    consecutive_losses = state.get("consecutive_losses", 0)
+    cooldown_until = state.get("cooldown_until", 0)
+    log(f"状态已加载: ${bankroll:.2f}/{trade_count}笔 ({win_count}W/{loss_count}L)", MODE)
+
+
+def save_state():
+    state = {
+        "bankroll": bankroll, "trade_count": trade_count,
+        "win_count": win_count, "loss_count": loss_count,
+        "total_withdrawn": total_withdrawn,
+        "consecutive_losses": consecutive_losses,
+        "cooldown_until": cooldown_until,
+    }
+    config.save_state(state)
+    try:
+        root_state = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/trader_state.json")
+        with open(root_state, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except:
+        pass
+
+
+def load_markets() -> list:
+    """加载市场数据，优先从 true_market/windows.jsonl 读取"""
+    markets = []
+    try:
+        # 优先读取 true_market/windows.jsonl（collector 写入）
+        if WINDOWS_FILE.exists():
+            seen_slugs = set()
+            with open(WINDOWS_FILE) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        # 只读取 polymarket_gamma 来源的记录
+                        if d.get("source") != "polymarket_gamma":
+                            continue
+                        slug = d.get("slug", "")
+                        if slug in seen_slugs:
+                            continue
+                        seen_slugs.add(slug)
+                        # 转换为 trader 期望的格式
+                        prices = {}
+                        outcome_prices = d.get("outcome_prices", "[]")
+                        if isinstance(outcome_prices, str):
+                            try:
+                                op = json.loads(outcome_prices)
+                                if len(op) >= 2:
+                                    prices[d.get("token_up", "")] = float(op[0])
+                                    prices[d.get("token_down", "")] = float(op[1])
+                            except:
+                                pass
+                        market = {
+                            "slug": slug,
+                            "priceToBeat": d.get("ptb", 0),
+                            "token_up": d.get("token_up", ""),
+                            "token_down": d.get("token_down", ""),
+                            "prices": prices,
+                            "closed": d.get("closed", False),
+                        }
+                        markets.append(market)
+                    except:
+                        pass
+            if markets:
+                return markets
+    except:
+        pass
+    
+    # 回退到 markets.jsonl
+    try:
+        if MARKETS_FILE.exists():
+            with open(MARKETS_FILE) as f:
+                return [json.loads(l) for l in f if l.strip()]
+    except:
+        pass
+    return []
+
+
+def fetch_ptb(slug: str) -> float:
+    """从 true_market/windows.jsonl 获取 PTB"""
+    try:
+        if WINDOWS_FILE.exists():
+            with open(WINDOWS_FILE) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("slug") == slug and d.get("source") == "polymarket_gamma":
+                            ptb = d.get("ptb", 0)
+                            if ptb and ptb > 0:
+                                return float(ptb)
+                    except:
+                        pass
+    except:
+        pass
+    
+    # 回退到 markets.jsonl
+    try:
+        if MARKETS_FILE.exists():
+            with open(MARKETS_FILE) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("slug") == slug and d.get("type") == "market_open":
+                            ptb = d.get("priceToBeat", 0)
+                            if ptb and ptb > 0:
+                                return float(ptb)
+                    except:
+                        pass
+    except:
+        pass
+    return 0.0
+
+
+def notify(msg):
+    with open(NOTIFY_FILE, "a") as f:
+        f.write(f"[{datetime.now(CN).strftime('%H:%M:%S')}] {msg}\n")
+    log(f"📢 {msg}", MODE)
+
+
+# ===== 主循环 =====
+def main():
+    global btc_price, bankroll, trade_count, win_count, loss_count, consecutive_losses, cooldown_until
+
+    log("=" * 50, MODE)
+    log("BTC 5M SIM TRADER", MODE)
+    log("模式: 纯模拟 · 不连接浏览器 · 不真实下单", MODE)
+    log("=" * 50, MODE)
+
+    config.load()
+    load_state()
+
+    # 启动价格线程
+    threading.Thread(target=btc_price_loop, daemon=True).start()
+
+    time.sleep(2)
+    btc_price = get_btc()
+
+    processed = set()
+
+    while True:
+        try:
+            now = int(time.time())
+            current_5m = (now // 300) * 300
+            slug = f"btc-updown-5m-{current_5m}"
+            remaining = current_5m + 300 - now
+
+            if cfg.get("paused", False):
+                time.sleep(5)
+                continue
+            if cooldown_until > now:
+                time.sleep(3)
+                continue
+            if slug in processed:
+                time.sleep(3)
+                continue
+
+            # 市场时间段窗口
+            if remaining > cfg["entry_second"] + 60:
+                time.sleep(remaining - cfg["entry_second"] - 55)
+                continue
+            if remaining < cfg["entry_second"] - 5:
+                if remaining > 5:
+                    time.sleep(remaining - 5)
+                processed.add(slug)
+                continue
+
+            # 加载市场
+            markets = load_markets()
+
+            # 获取PTB
+            ptb = fetch_ptb(slug)
+            if ptb <= 0:
+                m = find_market(markets, slug)
+                ptb = float(m.get("priceToBeat", 0))
+            if ptb <= 0:
+                processed.add(slug)
+                time.sleep(3)
+                continue
+
+            btc_price = get_btc()
+            if btc_price <= 0:
+                time.sleep(2)
+                continue
+
+            gap = btc_price - ptb
+
+            if abs(gap) < cfg["gap_threshold"]:
+                log(f"⏭ {slug} gap=${gap:+,.0f}<${cfg['gap_threshold']} 跳过", MODE, tag="SIM")
+                processed.add(slug)
+                time.sleep(3)
+                continue
+
+            direction = "Up" if gap > 0 else "Down"
+
+            # 获取token价格
+            m = find_market(markets, slug)
+            tid_up, tid_down = extract_tokens(m)
+            buy_price = 0
+
+            if m.get("prices"):
+                prices = m["prices"]
+                if direction == "Up":
+                    buy_price = prices.get(tid_up, 0)
+                else:
+                    buy_price = prices.get(tid_down, 0)
+
+            if buy_price <= 0 or buy_price >= 0.99:
+                log(f"⏭ {slug} 价格{buy_price:.3f}不可执行", MODE, tag="SIM")
+                processed.add(slug)
+                time.sleep(3)
+                continue
+            if buy_price < cfg["min_buy_price"]:
+                log(f"⏭ {slug} 概率{buy_price:.0%}<{cfg['min_buy_price']:.0%}", MODE, tag="SIM")
+                processed.add(slug)
+                time.sleep(3)
+                continue
+
+            # === 模拟下单 ===
+            bet_size = bankroll * cfg["bet_fraction"]
+            log(f"🎯 {slug} {direction} gap=${gap:+,.0f} @{buy_price:.3f} 下注${bet_size:.2f}", MODE, tag="SIM")
+
+            # 模拟结果：从 Polymarket 平台获取官方结算价
+            window_end_ts = current_5m + 300
+            platform_price = fetch_platform_crypto_price(current_5m, window_end_ts, max_retries=300, retry_interval=2.0)
+            
+            btc_final = platform_price.get("closePrice")
+            open_price = platform_price.get("openPrice") or ptb
+            settle_source = platform_price.get("source", "unknown")
+            
+            if btc_final is None or btc_final <= 0:
+                # 平台结算价未返回，标记为待结算
+                log(f"⚠️ 平台结算价未返回，标记为 pending: {slug}", MODE, tag="SIM")
+                record = {
+                    "slug": slug, "time": datetime.now(CN).isoformat(),
+                    "mode": "sim", "direction": direction,
+                    "market_slug": slug,
+                    "window_start_ts": current_5m,
+                    "window_end_ts": window_end_ts,
+                    "market_time": datetime.fromtimestamp(current_5m, CN).strftime("%Y/%m/%d %H:%M") + "-" + datetime.fromtimestamp(window_end_ts, CN).strftime("%H:%M"),
+                    "open_price": round(open_price, 2),
+                    "platform_open_price": round(open_price, 2),
+                    "btc_entry": round(btc_price, 2),
+                    "btc_final": None,
+                    "platform_close_price": None,
+                    "entry_gap": round(gap, 2),
+                    "settlement_gap": None,
+                    "probability": buy_price,
+                    "amount": bet_size,
+                    "pnl": None,
+                    "return": None,
+                    "settlement_status": "pending",
+                    "settle_source": settle_source,
+                    "settle_confirmed_at": None,
+                    "skip_reason": "platform_close_price_missing",
+                    "exclude_from_backtest": True,
+                    "status": "pending",
+                }
+                log_trade(record, MODE)
+                try:
+                    with open(ROOT_TRADES, "a") as f:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                except:
+                    pass
+                processed.add(slug)
+                continue
+            
+            # 正确的胜负判断规则：最终价 >= 开盘价则 Up 赢
+            actual_winner = "Up" if btc_final >= open_price else "Down"
+            won = (direction == actual_winner)
+            
+            if won:
+                profit = bet_size * (1 - buy_price) / buy_price
+                bankroll += profit
+                win_count += 1
+                consecutive_losses = 0
+                log(f"✅ 获胜! +${profit:.2f} 余额=${bankroll:.2f}", MODE, tag="SIM")
+            else:
+                loss = bet_size
+                bankroll -= loss
+                loss_count += 1
+                consecutive_losses += 1
+                log(f"❌ 亏损! -${loss:.2f} 余额=${bankroll:.2f}", MODE, tag="SIM")
+
+            trade_count += 1
+
+            record = {
+                "slug": slug, "time": datetime.now(CN).isoformat(),
+                "mode": "sim", "direction": direction,
+                "market_slug": slug,
+                "window_start_ts": current_5m,
+                "window_end_ts": window_end_ts,
+                "market_time": datetime.fromtimestamp(current_5m, CN).strftime("%Y/%m/%d %H:%M") + "-" + datetime.fromtimestamp(window_end_ts, CN).strftime("%H:%M"),
+                "open_price": round(open_price, 2),
+                "platform_open_price": round(open_price, 2),
+                "btc_entry": round(btc_price, 2),
+                "btc_final": round(btc_final, 2),
+                "platform_close_price": round(btc_final, 2),
+                "entry_gap": round(gap, 2),
+                "settlement_gap": round(btc_final - open_price, 2),
+                "probability": buy_price,
+                "amount": bet_size,
+                "pnl": round(profit if won else -loss, 2),
+                "return": round((profit if won else -loss) / bet_size, 4),
+                "settlement_status": "confirmed",
+                "settle_source": settle_source,
+                "settle_confirmed_at": datetime.now(CN).isoformat(),
+                "skip_reason": "",
+                "exclude_from_backtest": False,
+                "actual_winner": actual_winner,
+                "status": "won" if won else "lost",
+            }
+            log_trade(record, MODE)
+            try:
+                with open(ROOT_TRADES, "a") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except:
+                pass
+            save_state()
+            processed.add(slug)
+
+        except KeyboardInterrupt:
+            log("🛑 停止", MODE)
+            break
+        except Exception as e:
+            log(f"⚠️ 异常: {e}", MODE)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

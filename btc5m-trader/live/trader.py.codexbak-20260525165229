@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+BTC 5M Live Trader — 浏览器自动化执行
+完全隔离：独立 config / state / trades / logs
+"""
+import os, sys, json, time, threading, re
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
+
+from shared.utils import log, log_trade, CN
+from shared.config import Config
+from shared.btc_price import get_btc, get_btc_fresh, btc_price_loop, fetch_ptb, extract_tokens, find_market
+import browser_executor
+
+load_dotenv()
+
+# === 路径 ===
+MODE = "live"
+TRADER_DIR = Path(__file__).parent
+DATA_DIR = Path(f"/mnt/c/Users/yyq/Desktop/polymarket项目/btc5m数据/{MODE}")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# WebUI 读取的根目录 trades.jsonl
+ROOT_TRADES = Path("/mnt/c/Users/yyq/Desktop/polymarket项目/btc5m数据/trades.jsonl")
+
+STATE_FILE = DATA_DIR / "state.json"
+NOTIFY_FILE = DATA_DIR / "notify.txt"
+
+# === 钱包（从共享 .env 读取） ===
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", "0x23D779628967Db6D8896031a8Cdf739A9273d201")
+
+# === 数据目录（共享，只读） ===
+COLLECTOR_DATA = Path("/mnt/c/Users/yyq/Desktop/polymarket项目/btc5m数据/shared")
+MARKETS_FILE = COLLECTOR_DATA / "markets.jsonl"
+BTC_PRICE_FILE = COLLECTOR_DATA / "btc_price.jsonl"
+
+# === 运行时状态 ===
+config = Config(str(TRADER_DIR))
+cfg = config.data  # 快捷引用
+bankroll = 1.01
+trade_count = 0
+win_count = 0
+loss_count = 0
+total_withdrawn = 0.0
+consecutive_losses = 0
+cooldown_until = 0
+btc_price = 0.0
+
+browser_ready = False
+
+
+def load_state():
+    global bankroll, trade_count, win_count, loss_count, total_withdrawn, consecutive_losses, cooldown_until
+    state = config.load_state()
+    bankroll = state.get("bankroll", 1.01)
+    trade_count = state.get("trade_count", 0)
+    win_count = state.get("win_count", 0)
+    loss_count = state.get("loss_count", 0)
+    total_withdrawn = state.get("total_withdrawn", 0.0)
+    consecutive_losses = state.get("consecutive_losses", 0)
+    cooldown_until = state.get("cooldown_until", 0)
+    log(f"状态已加载: ${bankroll:.2f}/{trade_count}笔 ({win_count}W/{loss_count}L)", MODE)
+
+
+def record_skip(slug, reason, remaining=0):
+    """记录跳过事件到 trades.jsonl（WebUI 可见）"""
+    record = {
+        "slug": slug,
+        "time": datetime.now(CN).isoformat(),
+        "mode": "live",
+        "direction": "none",
+        "gap": 0,
+        "btc_entry": round(btc_price, 2) if btc_price else 0,
+        "ptb": 0,
+        "buy_price": 0,
+        "buy_amount": 0,
+        "seconds_left": remaining,
+        "won": False,
+        "net_profit": 0,
+        "status": "skipped",
+        "skip_reason": reason,
+    }
+    try:
+        with open(ROOT_TRADES, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except:
+        pass
+
+
+def save_state():
+    state = {
+        "bankroll": bankroll, "trade_count": trade_count,
+        "win_count": win_count, "loss_count": loss_count,
+        "total_withdrawn": total_withdrawn,
+        "consecutive_losses": consecutive_losses,
+        "cooldown_until": cooldown_until,
+        "executor_ready": browser_ready,
+    }
+    config.save_state(state)
+    # 同时写入根目录 trader_state.json 供 WebUI 读取
+    try:
+        root_state = Path("/mnt/c/Users/yyq/Desktop/polymarket项目/btc5m数据/trader_state.json")
+        with open(root_state, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except:
+        pass
+
+
+# === BTC 价格 ===
+def btc_update_loop():
+    global btc_price
+    while True:
+        try:
+            p = get_btc_fresh(retries=1)
+            if p > 0:
+                btc_price = p
+        except:
+            pass
+        time.sleep(1)
+
+
+def load_markets() -> list:
+    try:
+        if MARKETS_FILE.exists():
+            with open(MARKETS_FILE) as f:
+                return [json.loads(l) for l in f if l.strip()]
+    except:
+        pass
+    return []
+
+
+def markets_reader():
+    """每5秒加载一次市场数据"""
+    while True:
+        yield load_markets()
+        time.sleep(5)
+
+
+# === 通知 ===
+def notify(msg):
+    with open(NOTIFY_FILE, "a") as f:
+        f.write(f"[{datetime.now(CN).strftime('%H:%M:%S')}] {msg}\n")
+    log(f"📢 {msg}", MODE)
+
+
+# === 信号检测 ===
+def check_signal(markets, slug, now, current_5m):
+    """检测交易信号。返回 (direction, buy_price, token_id, gap) 或 None"""
+    global btc_price
+
+    # 获取PTB（从 Chainlink 缓存，不再依赖 gamma API 的 priceToBeat）
+    ptb = fetch_ptb(slug)
+    if ptb <= 0:
+        return None
+
+    if btc_price <= 0:
+        btc_price = get_btc_fresh()
+    if btc_price <= 0:
+        return None
+
+    gap = btc_price - ptb
+
+    # 检查gap阈值
+    if abs(gap) < cfg["gap_threshold"]:
+        return None
+
+    direction = "Up" if gap > 0 else "Down"
+    gap_abs = abs(gap)
+
+    # 获取token价格（从市场数据）
+    m = find_market(markets, slug)
+    tid_up, tid_down = extract_tokens(m)
+    buy_price = 0
+    token_id = ""
+
+    remaining = current_5m + 300 - now
+    if remaining < 5:
+        return None  # 太晚了
+
+    # 从市场数据读取最新价格
+    if m.get("prices"):
+        prices = m["prices"]
+        up_p = prices.get(tid_up, 0)
+        down_p = prices.get(tid_down, 0)
+        if direction == "Up":
+            buy_price = up_p if 0 < up_p < 1 else 0
+            token_id = tid_up
+        else:
+            buy_price = down_p if 0 < down_p < 1 else 0
+            token_id = tid_down
+
+    # 检查价格是否可执行
+    if buy_price <= 0 or buy_price >= 0.99:
+        return None
+    if buy_price < cfg["min_buy_price"]:
+        return None
+
+    return {
+        "direction": direction,
+        "buy_price": buy_price,
+        "token_id": token_id,
+        "gap": gap,
+        "ptb": ptb,
+        "btc_price": btc_price,
+        "remaining": remaining,
+    }
+
+
+# ===== 主循环 =====
+def main():
+    global browser_ready, btc_price, bankroll, trade_count, win_count, loss_count
+    global consecutive_losses, cooldown_until
+
+    log("=" * 50, MODE)
+    log("BTC 5M LIVE TRADER", MODE)
+    log(f"钱包: {FUNDER_ADDRESS[:10]}...{FUNDER_ADDRESS[-6:]}", MODE)
+    log("执行层: Browser Automation", MODE)
+    log("=" * 50, MODE)
+
+    # 加载配置和状态
+    config.load()
+    load_state()
+
+    # 检查浏览器执行器
+    browser_ready = browser_executor.check_ready()
+    if not browser_ready:
+        log("⚠️ 浏览器执行器不可用！请启动桌面「启动浏览器执行器.bat」", MODE)
+        log("继续运行，但不会真实下单", MODE)
+
+    # 启动价格线程
+    threading.Thread(target=btc_update_loop, daemon=True).start()
+
+    # 首次等待BTC价格
+    time.sleep(3)
+    btc_price = get_btc()
+
+    # 主循环
+    processed = set()
+    market_gen = markets_reader()
+
+    while True:
+        try:
+            now = int(time.time())
+            current_5m = (now // 300) * 300
+            slug = f"btc-updown-5m-{current_5m}"
+            remaining = current_5m + 300 - now
+
+            # 检查暂停
+            if cfg.get("paused", False):
+                time.sleep(5)
+                continue
+
+            # 检查冷却
+            if cooldown_until > now:
+                time.sleep(3)
+                continue
+
+            # 跳过已处理市场
+            if slug in processed:
+                time.sleep(3)
+                continue
+
+            # 入场窗口
+            if remaining < cfg["entry_second"] + 5:
+                if remaining > 5:
+                    time.sleep(remaining - 5)
+                processed.add(slug)
+                continue
+
+            # 如果市场太新，等一会
+            if remaining > cfg["entry_second"] + 60:
+                time.sleep(remaining - cfg["entry_second"] - 55)
+                continue
+
+            # 加载市场数据
+            markets = load_markets()
+
+            # 检查信号
+            sig = check_signal(markets, slug, now, current_5m)
+            if not sig:
+                log(f"⏭ {slug} 无信号 (gap<${cfg['gap_threshold']} 或价格不可买)", MODE, tag="LIVE")
+                # 读取 gap 用于显示
+                m = find_market(markets, slug)
+                ptb = float(m.get("priceToBeat", 0)) if m else 0
+                gap = btc_price - ptb if ptb > 0 else 0
+                reason = f"价差${abs(gap):.0f}<${cfg['gap_threshold']}" if abs(gap) < cfg['gap_threshold'] else "条件不满足"
+                record_skip(slug, reason, remaining)
+                processed.add(slug)
+                time.sleep(3)
+                continue
+
+            direction = sig["direction"]
+            buy_price = sig["buy_price"]
+            gap = sig["gap"]
+
+            # 计算下注
+            bet_size = bankroll * cfg["bet_fraction"]
+            size = round(bet_size / buy_price, 2)
+
+            log(f"🎯 信号触发! {slug} gap=${gap:+,.0f} {direction} @{buy_price:.3f} 下注${bet_size:.2f}", MODE, tag="LIVE")
+
+            # ===== 执行下单 =====
+            if browser_ready:
+                log(f"[Browser] 🚀 下单: {direction} ${buy_price:.3f} x{size} 股", MODE)
+                result = browser_executor.place_order(direction, buy_price, slug)
+                if result.get("success"):
+                    log(f"[Browser] ✅ 下单成功", MODE)
+                else:
+                    log(f"[Browser] ❌ 下单失败: {result.get('error', 'unknown')}", MODE)
+            else:
+                log(f"⏭ 浏览器未就绪，跳过真实下单", MODE)
+                record_skip(slug, "浏览器执行器未就绪", remaining)
+
+            # 记录交易
+            record = {
+                "slug": slug,
+                "time": datetime.now(CN).isoformat(),
+                "mode": "live",
+                "direction": direction,
+                "gap": round(gap, 2),
+                "btc_entry": round(btc_price, 2),
+                "ptb": round(sig["ptb"], 2),
+                "buy_price": buy_price,
+                "buy_amount": size,
+                "status": "placed" if browser_ready else "simulated",
+                "executor": "browser" if browser_ready else "none",
+            }
+            log_trade(record, MODE)
+            # 同时写入根目录 trades.jsonl 供 WebUI 读取
+            try:
+                with open(ROOT_TRADES, "a") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except:
+                pass
+            processed.add(slug)
+
+            # 等待结算
+            settle_time = current_5m + 300 + 5
+            wait = settle_time - time.time()
+            if wait > 0:
+                log(f"⏳ 等待结算 ({wait:.0f}s)...", MODE)
+                time.sleep(wait)
+
+            # ===== 结算 =====
+            btc_final = get_btc_fresh(retries=3)
+            ptb = sig["ptb"]
+            won = (direction == "Up" and btc_final > ptb) or (direction == "Down" and btc_final < ptb)
+
+            if won:
+                profit = bet_size * (1 - buy_price) / buy_price
+                bankroll += profit
+                win_count += 1
+                consecutive_losses = 0
+                log(f"✅ 获胜! 利润+${profit:.2f} 余额=${bankroll:.2f}", MODE, tag="LIVE")
+            else:
+                loss = bet_size
+                bankroll -= loss
+                loss_count += 1
+                consecutive_losses += 1
+                log(f"❌ 亏损! -${loss:.2f} 余额=${bankroll:.2f}", MODE, tag="LIVE")
+
+            trade_count += 1
+            save_state()
+
+        except KeyboardInterrupt:
+            log("🛑 停止", MODE)
+            break
+        except Exception as e:
+            log(f"⚠️ 异常: {e}", MODE)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

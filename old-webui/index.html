@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTC 5M 交易系统</title>
+<script src="echarts.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;font-size:13px}
+.header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.header h1{font-size:16px;color:#58a6ff}
+.header .stats{font-size:12px;color:#8b949e}
+.live-bar{display:flex;align-items:center;gap:10px;margin-left:auto;font-size:11px;background:#21262d;padding:5px 12px;border-radius:6px;border:1px solid #30363d}
+.live-bar .dot{width:7px;height:7px;border-radius:50%;background:#3fb950;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.live-bar .btc{color:#f0883e;font-weight:700}
+.live-bar .gap-pos{color:#3fb950;font-weight:600}
+.live-bar .gap-neg{color:#f85149;font-weight:600}
+.tabs{display:flex;gap:0;margin-left:16px}
+.tab{padding:5px 14px;font-size:12px;cursor:pointer;border-bottom:2px solid transparent;color:#8b949e;transition:.15s;font-weight:500}
+.tab:hover{color:#c9d1d9}
+.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.main{display:flex;height:calc(100vh - 44px)}
+.sidebar{width:270px;background:#161b22;border-right:1px solid #30363d;overflow-y:auto;flex-shrink:0}
+.sidebar-filter{padding:8px;border-bottom:1px solid #30363d;display:flex;gap:4px;flex-wrap:wrap}
+.filter-btn{padding:3px 9px;border-radius:4px;border:1px solid #30363d;background:#21262d;color:#8b949e;font-size:10px;cursor:pointer;transition:.12s}
+.filter-btn:hover{color:#c9d1d9}
+.filter-btn.active{background:#1f6feb;border-color:#58a6ff;color:#fff}
+.sidebar-search{padding:6px 8px;border-bottom:1px solid #30363d;display:flex;gap:4px}
+.sidebar-search input{flex:1;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:5px 8px;border-radius:4px;font-size:11px;outline:none}
+.sidebar-search input:focus{border-color:#58a6ff}
+.sidebar-item{padding:8px 12px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:12px;transition:.15s;border-left:3px solid transparent}
+.sidebar-item:hover{background:#1c2128;border-left-color:#30363d}
+.sidebar-item.active{background:rgba(31,111,235,.1);border-left:3px solid #58a6ff}
+.sidebar-item .left{display:flex;flex-direction:column;gap:1px}
+.sidebar-item .time{color:#c9d1d9;font-weight:500}
+.sidebar-item .sub{font-size:10px;color:#8b949e}
+.sidebar-item .result{padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700}
+.result.up{background:#238636;color:#fff}.result.down{background:#da3633;color:#fff}.result.pending{background:#d29922;color:#000;animation:blink 1.5s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+.content{flex:1;overflow-y:auto;padding:20px 24px;background:#0d1117}
+.info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
+.info-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px}
+.info-card .label{font-size:10px;color:#8b949e;margin-bottom:3px}
+.info-card .value{font-size:17px;font-weight:700;color:#c9d1d9}
+.info-card .value.green{color:#3fb950}.info-card .value.red{color:#f85149}
+.chart-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+.chart-box h3{font-size:13px;color:#8b949e;margin-bottom:10px;font-weight:500}
+.empty{display:flex;align-items:center;justify-content:center;height:100%;color:#484f58;font-size:15px}
+.ctrl{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:14px}
+.ctrl h3{font-size:14px;color:#c9d1d9;margin-bottom:12px;font-weight:600}
+.ctrl-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #21262d;flex-wrap:wrap}
+.ctrl-row:last-child{border:none}
+.ctrl-label{min-width:100px;color:#8b949e;font-size:11px;font-weight:500}
+.ctrl-value{min-width:50px;color:#58a6ff;font-weight:700;font-size:13px;text-align:center}
+.ctrl-btns{display:flex;gap:4px;flex-wrap:wrap}
+.ctrl-btn{padding:4px 10px;border-radius:5px;border:1px solid #30363d;background:#21262d;color:#8b949e;font-size:11px;cursor:pointer;transition:all .12s;font-weight:500}
+.ctrl-btn:hover{background:#30363d;color:#c9d1d9}
+.ctrl-btn.active{background:#1f6feb;border-color:#58a6ff;color:#fff;font-weight:600}
+.ctrl-btn.save{background:#238636;border-color:#3fb950;color:#fff;font-size:13px;padding:8px 20px;font-weight:600}
+.ctrl-btn.save:hover{background:#2ea043}
+.ctrl-btn.danger{background:#da3633;border-color:#f85149;color:#fff;font-size:13px;padding:8px 20px;font-weight:600}
+.ctrl-btn.danger:hover{background:#b62324}
+.start-btn{font-size:16px;padding:14px 36px;border-radius:10px;font-weight:700;cursor:pointer;border:2px solid;transition:.15s}
+.start-btn.running{background:#238636;border-color:#3fb950;color:#fff;box-shadow:0 0 14px rgba(35,134,54,.2)}
+.start-btn.running:hover{background:#2ea043;box-shadow:0 0 22px rgba(35,134,54,.3)}
+.start-btn.paused{background:#d29922;border-color:#e3b341;color:#000}
+.start-btn.paused:hover{background:#e3b341}
+.confirm-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);backdrop-filter:blur(3px);z-index:998;display:flex;align-items:center;justify-content:center}
+.confirm-box{background:#161b22;border:2px solid #da3633;border-radius:12px;padding:28px;max-width:380px;text-align:center}
+.confirm-box h3{color:#f85149;font-size:17px;margin-bottom:10px}
+.confirm-box p{color:#c9d1d9;font-size:13px;margin-bottom:16px;line-height:1.5}
+.confirm-box .btns{display:flex;gap:10px;justify-content:center}
+.mode-toggle{display:flex;border-radius:6px;overflow:hidden;border:2px solid #30363d}
+.mode-toggle button{padding:8px 20px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:.12s}
+.mode-sim-btn{background:#1f6feb;color:#fff}.mode-sim-btn.off{background:#21262d;color:#484f58}
+.mode-live-btn{background:#21262d;color:#484f58}.mode-live-btn.on{background:#da3633;color:#fff}
+.save-feedback{position:fixed;top:14px;right:14px;background:#238636;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;z-index:999;opacity:0;transform:translateY(-20px);transition:all .25s}
+.save-feedback.show{opacity:1;transform:translateY(0)}
+.trades-table{width:100%;border-collapse:collapse;font-size:11px}
+.trades-table th{background:#21262d;color:#8b949e;padding:6px 7px;text-align:left;font-weight:500;position:sticky;top:0;border-bottom:2px solid #30363d;white-space:nowrap}
+.trades-table td{padding:5px 7px;border-bottom:1px solid #21262d;white-space:nowrap}
+.trades-table tr:hover td{background:rgba(31,111,235,.03)}
+.win-text{color:#3fb950;font-weight:600}.loss-text{color:#f85149;font-weight:600}
+.trade-status{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700}
+.trade-status.pending{color:#d29922;background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.2);animation:blink 1.5s infinite}
+.trade-status.skipped{color:#484f58;background:rgba(72,79,88,.06)}
+.trade-status.won{color:#3fb950;background:rgba(35,134,54,.1)}
+.trade-status.lost{color:#f85149;background:rgba(218,54,53,.1)}
+.live-badge{background:#da3633;color:#fff;padding:1px 5px;border-radius:2px;font-size:9px;font-weight:700;margin-left:3px}
+/* 移动端 */
+@media(max-width:768px){
+  .header{padding:8px 10px;gap:8px}.header h1{font-size:14px}
+  .live-bar{flex-wrap:wrap;gap:4px;font-size:10px;padding:3px 8px;margin-left:0}
+  .tabs{margin-left:4px}.tab{padding:4px 8px;font-size:11px}
+  .main{flex-direction:column;height:auto;min-height:calc(100vh-44px)}
+  .sidebar{width:100%;height:35vh;min-height:200px;border-right:none;border-bottom:1px solid #30363d}
+  .content{height:65vh;min-height:350px;padding:12px}
+  .info-grid{grid-template-columns:repeat(2,1fr);gap:6px}
+  .ctrl-btn{padding:3px 8px;font-size:10px}
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>📊 BTC 5M</h1>
+  <span class="stats" id="stats"></span>
+  <div class="live-bar" id="liveBar">
+    <span class="dot"></span>
+    <span>剩余 <b id="liveSec" style="color:#58a6ff">-</b>s</span>
+    <span>现价 <b class="btc" id="liveBtc">-</b></span>
+    <span>PTB <b id="livePtb">-</b></span>
+    <span>差 <b id="liveGap">-</b></span>
+    <span>Up <b id="liveUp">-</b></span>
+    <span>Down <b id="liveDown">-</b></span>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-tab="markets" onclick="switchTab('markets')">市场列表</div>
+    <div class="tab" data-tab="trader" onclick="switchTab('trader')">🤖 交易控制</div>
+  </div>
+</div>
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-filter" id="sidebarFilter">
+      <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">全部</button>
+      <button class="filter-btn" data-filter="up" onclick="setFilter('up')">Up</button>
+      <button class="filter-btn" data-filter="down" onclick="setFilter('down')">Down</button>
+      <button class="filter-btn" data-filter="rev" onclick="setFilter('rev')">⚠ 反转</button>
+      <button class="filter-btn" data-filter="pending" onclick="setFilter('pending')">⏳ 未结算</button>
+    </div>
+    <div class="sidebar-search">
+      <input type="text" id="search" placeholder="🔍 搜索时间..." style="flex:1">
+      <button onclick="refreshData()" style="background:#21262d;border:1px solid #30363d;color:#8b949e;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:11px">🔄</button>
+    </div>
+    <div id="list"></div>
+  </div>
+  <div class="content" id="content"><div class="empty">← 点击左侧市场查看详情</div></div>
+</div>
+<div class="save-feedback" id="feedback">✅ 配置已保存</div>
+
+<script>
+let DATA=[], TRADER=null, activeIdx=-1, currentTab='markets', currentFilter='all';
+let pendingConfig={};
+
+function loadData(){
+  Promise.all([
+    fetch('data.json').then(r=>r.json()).catch(()=>[]),
+    fetch('/api/trader').then(r=>r.json()).catch(()=>null),
+    fetch('/api/status').then(r=>r.json()).catch(()=>({paused:true,service_active:false})),
+    fetch('/api/config').then(r=>r.json()).catch(()=>({}))
+  ]).then(([d,t,s,c])=>{
+    DATA=d;
+    if(t){t.service_active=s.service_active;t.paused=s.paused}
+    if(t&&c&&!t.config) t.config=c;
+    TRADER=t;
+    const rev=d.filter(x=>x.reversals&&x.reversals.length).length;
+    const unsettled=d.filter(x=>!x.settled).length;
+    document.getElementById('stats').textContent=`${d.length} 市场 | ${rev} 个反转 | ${unsettled} 未结算`;
+    renderSidebar();
+    updateLiveBar();
+    if(currentTab==='trader') renderTrader();
+    else if(activeIdx>=0) selectMarket(activeIdx);
+    else renderDashboard();
+  }).catch(()=>{});
+}
+loadData();
+setInterval(loadData,5000);
+
+function updateLiveBar(){
+  fetch('/api/live').then(r=>r.json()).then(d=>{
+    document.getElementById('liveSec').textContent=d.sec_left;
+    document.getElementById('liveSec').style.color=d.sec_left<=15?'#f85149':(d.sec_left<=30?'#d29922':'#58a6ff');
+    document.getElementById('liveBtc').textContent='$'+d.btc_price.toLocaleString();
+    document.getElementById('livePtb').textContent='$'+d.ptb.toLocaleString();
+    const g=document.getElementById('liveGap');
+    g.textContent=(d.gap>=0?'+':'')+'$'+Math.abs(d.gap).toFixed(0);
+    g.className=d.gap>=0?'gap-pos':'gap-neg';
+    document.getElementById('liveUp').textContent=d.up_price?d.up_price.toFixed(3):'-';
+    document.getElementById('liveDown').textContent=d.down_price?d.down_price.toFixed(3):'-';
+  }).catch(()=>{});
+}
+setInterval(updateLiveBar,2000);
+
+function refreshData(){
+  const btn=document.querySelector('button[onclick="refreshData()"]');
+  if(btn){btn.textContent='⏳';btn.disabled=true}
+  fetch('/api/refresh',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.ok){toast(d.message);loadData()}
+    if(btn){btn.textContent='🔄';btn.disabled=false}
+  }).catch(()=>{if(btn){btn.textContent='🔄';btn.disabled=false}});
+}
+
+function setFilter(f){
+  currentFilter=f;
+  document.querySelectorAll('.filter-btn').forEach(b=>b.classList.toggle('active',b.dataset.filter===f));
+  renderSidebar();
+}
+
+function switchTab(tab){
+  currentTab=tab;
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  if(tab==='trader') renderTrader();
+  else if(activeIdx>=0) selectMarket(activeIdx);
+  else renderDashboard();
+}
+
+function renderSidebar(){
+  const list=document.getElementById('list'), filter=document.getElementById('search').value||'';
+  let items=DATA;
+  if(currentFilter==='up') items=DATA.filter(x=>x.gap>0);
+  else if(currentFilter==='down') items=DATA.filter(x=>x.gap<0);
+  else if(currentFilter==='rev') items=DATA.filter(x=>x.reversals&&x.reversals.length);
+  else if(currentFilter==='pending') items=DATA.filter(x=>!x.settled);
+  if(filter) items=items.filter(x=>x.start&&x.start.includes(filter));
+  
+  list.innerHTML=items.map((d,i)=>{
+    const idx=DATA.indexOf(d);
+    const ac=idx===activeIdx?' active':'';
+    const gap=d.settled?(d.gap||0):0;
+    let res='',rcls='';
+    if(!d.settled){res='⏳ 等待';rcls='pending'}
+    else if(gap>0){res='UP';rcls='up'}
+    else if(gap<0){res='DOWN';rcls='down'}
+    else{res='—';rcls=''}
+    const revMark=d.reversals&&d.reversals.length?`<span class="badge badge-rev">!</span>`:'';
+    return `<div class="sidebar-item${ac}" onclick="selectMarket(${idx})">
+      <div class="left"><span class="time">${d.start||'?'}-${d.end||'?'}</span><span class="sub">gap: $${gap.toFixed(0)} ${d.winner||''}</span></div>
+      <span class="result ${rcls}">${res}</span>${revMark}
+    </div>`;
+  }).join('');
+}
+
+function selectMarket(i){
+  activeIdx=i; renderSidebar(); switchTab('markets');
+  const d=DATA[i];
+  if(!d) return;
+  const c=document.getElementById('content');
+  let html=`<h2 style="font-size:18px;margin-bottom:16px">${d.start}-${d.end} ${d.settled?'✅ 已结算':'⏳ 未结算'}</h2>`;
+  
+  // 信息卡片
+  html+=`<div class="info-grid">
+    <div class="info-card"><div class="label">PTB（开盘价）</div><div class="value">$${d.ptb?d.ptb.toLocaleString():'-'}</div></div>
+    <div class="info-card"><div class="label">结算价</div><div class="value">${d.settled?'$'+d.btc_end.toLocaleString():'⏳'}</div></div>
+    <div class="info-card"><div class="label">价差</div><div class="value ${d.gap>0?'green':'red'}">${d.settled?(d.gap>0?'+':'')+'$'+Math.abs(d.gap).toFixed(1):'-'}</div></div>
+    <div class="info-card"><div class="label">结果</div><div class="value ${d.winner==='up'?'green':'red'}">${d.winner?d.winner.toUpperCase():'?'}</div></div>
+    <div class="info-card"><div class="label">反转次数</div><div class="value yellow">${d.reversals?d.reversals.length:0}</div></div>
+    <div class="info-card"><div class="label">事件数</div><div class="value">${d.events||0}</div></div>
+  </div>`;
+  
+  // BTC价格走势图
+  if(d.btc_points&&d.btc_points.length){
+    html+=`<div class="chart-box"><h3>BTC 价格 vs PTB</h3><div id="chart1" style="width:100%;height:300px"></div></div>`;
+  }
+
+  c.innerHTML=html;
+  
+  // 渲染图表
+  if(d.btc_points&&d.btc_points.length){
+    setTimeout(()=>{
+      const el=document.getElementById('chart1');
+      if(!el) return;
+      const chart=echarts.init(el);
+      const btc=d.btc_points.map(p=>p.p);
+      const times=Array.from({length:btc.length},(_,i)=>i);
+      chart.setOption({
+        backgroundColor:'transparent',
+        grid:{top:20,right:30,bottom:30,left:60},
+        tooltip:{trigger:'axis',backgroundColor:'#161b22',borderColor:'#30363d',textStyle:{color:'#c9d1d9',fontSize:11}},
+        xAxis:{type:'category',data:times,axisLabel:{formatter:v=>v+'s',color:'#8b949e',fontSize:10},axisLine:{lineStyle:{color:'#30363d'}}},
+        yAxis:{type:'value',scale:true,axisLabel:{color:'#8b949e',formatter:v=>'$'+v.toLocaleString()},splitLine:{lineStyle:{color:'#21262d'}}},
+        series:[{
+          type:'line',data:btc,symbol:'none',lineStyle:{color:'#f0883e',width:2},
+          areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(240,136,62,.15)'},{offset:1,color:'rgba(240,136,62,.01)'}])},
+          markLine:{silent:true,data:[{yAxis:d.ptb,lineStyle:{color:'#da3633',type:'dashed',width:1.5},label:{show:true,formatter:'PTB',color:'#da3633',position:'end',fontSize:10}}]}
+        }]
+      });
+    },100);
+  }
+
+  // 反转事件
+  if(d.reversals&&d.reversals.length){
+    html+=`<div class="chart-box"><h3>反转事件 (${d.reversals.length})</h3>`;
+    d.reversals.forEach(r=>{
+      html+=`<div style="margin-bottom:8px;padding:8px;background:#21262d;border-radius:4px;font-size:12px">
+        <span style="color:#d29922">⚠</span> ${r.t}s: <span style="color:#3fb950">${r.from}</span> → <span style="color:#f85149">${r.to}</span>
+        (gap: ${r.gap!==undefined?'$'+r.gap.toFixed(1):'-'})
+      </div>`;
+    });
+    html+='</div>';
+  }
+  c.innerHTML=html;
+}
+
+function renderDashboard(){
+  const c=document.getElementById('content');
+  if(!TRADER||!DATA.length){c.innerHTML='<div class="empty">加载中...</div>';return}
+  const t=TRADER;
+  const wr=t.trade_count>0?(t.win_count/t.trade_count*100).toFixed(1):'0.0';
+  const rev=DATA.filter(x=>x.reversals&&x.reversals.length).length;
+  const us=DATA.filter(x=>!x.settled).length;
+  const up=DATA.filter(x=>x.settled&&x.winner==='up').length;
+  const dn=DATA.filter(x=>x.settled&&x.winner==='down').length;
+  
+  c.innerHTML=`<h2 style="font-size:18px;margin-bottom:16px">仪表盘概览</h2>
+    <div class="info-grid">
+      <div class="info-card"><div class="label">资金</div><div class="value">$${t.bankroll.toFixed(2)}</div></div>
+      <div class="info-card"><div class="label">胜率</div><div class="value ${wr>50?'green':'red'}">${wr}%</div></div>
+      <div class="info-card"><div class="label">战绩</div><div class="value">${t.trade_count}笔 <span style="color:#3fb950">${t.win_count}W</span>/<span style="color:#f85149">${t.loss_count}L</span></div></div>
+      <div class="info-card"><div class="label">已提利润</div><div class="value green">$${t.total_withdrawn.toFixed(2)}</div></div>
+      <div class="info-card"><div class="label">总市场</div><div class="value">${DATA.length}</div></div>
+      <div class="info-card"><div class="label">已结算</div><div class="value">${up+dn}</div></div>
+      <div class="info-card"><div class="label">未结算</div><div class="value yellow">${us}</div></div>
+      <div class="info-card"><div class="label">UP赢/DOWN赢</div><div class="value"><span style="color:#3fb950">${up}</span>/<span style="color:#f85149">${dn}</span></div></div>
+    </div>`;
+}
+
+// ======================== 交易控制 ========================
+function renderTrader(){
+  const c=document.getElementById('content'),t=TRADER;
+  if(!t){c.innerHTML='<div class="empty">加载中...</div>';return}
+  const cfg={...(t.config||{}),...pendingConfig};
+  const wr=t.trade_count>0?(t.win_count/t.trade_count*100).toFixed(1):'0.0';
+  const ic=cfg.initial_capital||1;
+  const isPaused=cfg.paused!==false;
+  const isLive=cfg.mode==='live';
+  
+  let html=`<h2 style="font-size:18px;margin-bottom:16px">🤖 交易控制面板</h2>`;
+
+  // 启动/停止
+  html+=`<div style="text-align:center;margin-bottom:16px;padding:20px;background:#161b22;border:1px solid #30363d;border-radius:10px">
+    <div style="font-size:12px;color:#8b949e;margin-bottom:10px">${isLive?'<span style="color:#f85149;font-weight:700">🔴 实盘模式</span>':'<span style="color:#58a6ff">🔵 模拟模式</span>'} · 服务: <b style="color:${t.service_active?'#3fb950':'#f85149'}">${t.service_active?'运行中':'未运行'}</b></div>
+    <button class="start-btn ${isPaused?'paused':'running'}" onclick="toggleBot()">${isPaused?'▶️ 启动交易':'⏸ 暂停交易'}</button>
+    <div style="font-size:11px;color:#484f58;margin-top:8px">${isPaused?'机器人已暂停':'机器人运行中'}</div>
+  </div>`;
+
+  // 关键指标
+  html+=`<div class="info-grid">
+    <div class="info-card"><div class="label">资金</div><div class="value">$${(t.bankroll||0).toFixed(2)}</div></div>
+    <div class="info-card"><div class="label">已提利润</div><div class="value green">$${(t.total_withdrawn||0).toFixed(2)}</div></div>
+    <div class="info-card"><div class="label">战绩</div><div class="value">${t.trade_count||0}笔 <span style="color:#3fb950">${t.win_count||0}W</span>/<span style="color:#f85149">${t.loss_count||0}L</span> (${wr}%)</div></div>
+  </div>`;
+
+  // 交易模式
+  html+=`<div class="ctrl">
+    <h3>⚙️ 交易模式</h3>
+    <div class="ctrl-row"><span class="ctrl-label">当前模式</span>
+      <div class="mode-toggle">
+        <button class="mode-sim-btn ${!isLive?'':'off'}" onclick="setCfg('mode','sim')">🔵 模拟交易</button>
+        <button class="mode-live-btn ${isLive?'on':''}" onclick="confirmLive()">🔴 实盘交易</button>
+      </div>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">初始资金</span>
+      <div class="ctrl-btns">${[1,2,5,10,20].map(v=>`<button class="ctrl-btn${ic===v?' active':''}" onclick="setCfg('initial_capital',${v})">$${v}</button>`).join('')}</div>
+      <span class="ctrl-value">$${ic}</span>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">重置资金</span>
+      <button class="ctrl-btn danger" onclick="resetCapital()">🔄 重置为 $${ic}</button>
+    </div>
+  </div>`;
+
+  // 策略参数
+  html+=`<div class="ctrl">
+    <h3>⚙️ 策略参数 <span style="font-size:11px;color:#484f58;font-weight:400">— 10秒内生效</span></h3>
+    <div style="background:#21262d;padding:10px;border-radius:6px;margin-bottom:12px;font-size:11px;color:#8b949e">
+      📡 Gap决定方向，概率确认。T-25s到T-5s每秒检查，gap≥阈值+概率≥最低+价格有效 → 入场。100%梭哈，亏损重置。
+    </div>
+    <div style="margin-bottom:12px">
+      <button class="ctrl-btn" onclick="loadDefaultStrategy()" style="background:#238636;border-color:#3fb950;color:#fff">📋 加载默认策略</button>
+      <span style="font-size:11px;color:#8b949e;margin-left:8px">T-25s, gap≥$10, 概率≥60%, 100%梭哈</span>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">入场时间</span>
+      <div class="ctrl-btns">${[10,15,20,25,30].map(v=>`<button class="ctrl-btn${(cfg.entry_second||25)===v?' active':''}" onclick="setCfg('entry_second',${v})">T-${v}s</button>`).join('')}</div>
+      <span class="ctrl-value">T-${cfg.entry_second||25}s</span>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">Gap阈值</span>
+      <div class="ctrl-btns">${[0,5,10,15,20,30,50].map(v=>`<button class="ctrl-btn${(cfg.gap_threshold||10)===v?' active':''}" onclick="setCfg('gap_threshold',${v})">$${v}</button>`).join('')}</div>
+      <span class="ctrl-value">≥$${cfg.gap_threshold||10}</span>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">最低概率</span>
+      <div class="ctrl-btns">${[0.55,0.60,0.65,0.70,0.75,0.80,0.85].map(v=>`<button class="ctrl-btn${(cfg.min_buy_price||0.60)===v?' active':''}" onclick="setCfg('min_buy_price',${v})">${(v*100).toFixed(0)}%</button>`).join('')}</div>
+      <span class="ctrl-value">≥${(cfg.min_buy_price||0.60)*100}%</span>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">下注比例</span>
+      <div class="ctrl-btns">${[{v:1.0,l:'100%'},{v:0.50,l:'50%'},{v:0.25,l:'25%'}].map(o=>`<button class="ctrl-btn${cfg.bet_fraction===o.v?' active':''}" onclick="setCfg('bet_fraction',${o.v})">${o.l}</button>`).join('')}</div>
+      <span class="ctrl-value">${((cfg.bet_fraction||1)*100).toFixed(0)}%</span>
+    </div>
+    <div class="ctrl-row"><span class="ctrl-label">风控冷却</span>
+      <div class="ctrl-btns">
+        <button class="ctrl-btn" onclick="setCfg('cooldown_seconds',(cfg.cooldown_seconds||0)>0?0:900)" style="${(cfg.cooldown_seconds||0)>0?'background:#238636;border-color:#3fb950;color:#fff':''}">${(cfg.cooldown_seconds||0)>0?'✅ 已开启':'⬜ 关闭'}</button>
+        ${[60,300,600,900,1800].map(v=>`<button class="ctrl-btn${(cfg.cooldown_seconds||0)===v?' active':''}" onclick="setCfg('cooldown_seconds',${v})" ${(cfg.cooldown_seconds||0)===0?'disabled style="opacity:.4"':''}>${v/60}分</button>`).join('')}
+      </div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:10px;align-items:center">
+      <button class="ctrl-btn save" onclick="saveConfig()">💾 保存配置</button>
+      <span style="font-size:11px;color:#484f58" id="save-status"></span>
+    </div>
+  </div>`;
+
+  // 交易记录表
+  if(t.recent_trades&&t.recent_trades.length){
+    const allTrades=t.recent_trades.slice().reverse();
+    const totalPages=Math.ceil(allTrades.length/15);
+    if(typeof tradePage==='undefined') window.tradePage=1;
+    if(tradePage>totalPages) tradePage=totalPages;
+    const start=(tradePage-1)*15;
+    const pageTrades=allTrades.slice(start,start+15);
+
+    html+=`<div class="ctrl"><h3 style="display:flex;justify-content:space-between;align-items:center">
+      <span>📋 最近交易 (${allTrades.length}条)</span>
+      <span style="font-size:11px;color:#8b949e">
+        <button class="ctrl-btn" onclick="exportCSV()" style="background:#238636;border-color:#3fb950;color:#fff;font-size:10px;padding:2px 8px">📥 CSV</button>
+        <button class="ctrl-btn" onclick="tradePage=Math.max(1,tradePage-1);renderTrader()" ${tradePage<=1?'disabled':''} style="font-size:10px;padding:2px 8px">◀</button>
+        <span>${tradePage}/${totalPages}</span>
+        <button class="ctrl-btn" onclick="tradePage=Math.min(${totalPages},tradePage+1);renderTrader()" ${tradePage>=totalPages?'disabled':''} style="font-size:10px;padding:2px 8px">▶</button>
+      </span>
+    </h3>
+    <div style="overflow-x:auto;max-height:500px;overflow-y:auto"><table class="trades-table"><thead><tr>
+    <th>状态</th><th>时间</th><th>方向</th><th>开盘价</th><th>买入BTC</th><th>结算价</th><th>买入差</th><th>结算差</th><th>概率</th><th>投入</th><th>入场</th><th>盈亏</th><th>回报</th>
+    </tr></thead><tbody>`;
+
+    pageTrades.forEach(tr=>{
+      const st=tr.status||'pending';
+      const stLabel=st==='skipped'?'⏭ 跳过':(st==='pending'?'⏳ 等待':(tr.won?'✅ 赢':'❌ 亏'));
+      const dc=st==='skipped'?'':(tr.direction==='up'?'win-text':'loss-text');
+      const pc=st==='skipped'?'':(tr.won?'win-text':(!tr.won&&st!=='pending'?'loss-text':''));
+      const gapV=tr.entry_gap||tr.gap||0;
+      const setGap=(tr.btc_final&&tr.ptb)?(tr.btc_final-tr.ptb):0;
+      const roi=tr.buy_amount>0?(tr.net_profit/tr.buy_amount*100):0;
+      const sl=tr.seconds_left||0;
+      const slColor=sl<=5?'#f85149':(sl<=10?'#d29922':'#8b949e');
+
+      html+=`<tr>
+        <td><span class="trade-status ${st}">${stLabel}</span>${tr.mode==='live'?'<span class="live-badge">L</span>':''}</td>
+        <td>${(tr.time||'').substring(5,19).replace('T',' ')}</td>
+        <td class="${dc}" style="font-weight:700">${(tr.direction||'').toUpperCase()}</td>
+        <td>$${(tr.ptb||0).toLocaleString()}</td>
+        <td style="color:#f0883e;font-weight:600">$${(tr.btc_entry||0).toLocaleString()}</td>
+        <td>${st==='pending'?'-':'$'+(tr.btc_final||0).toLocaleString()}</td>
+        <td style="color:${gapV>=0?'#3fb950':'#f85149'}">${gapV>=0?'+':''}$${Math.abs(gapV).toFixed(0)}</td>
+        <td style="color:${setGap>=0?'#3fb950':'#f85149'}">${st==='pending'?'—':(setGap>=0?'+':'')+'$'+Math.abs(setGap).toFixed(0)}</td>
+        <td>${st==='skipped'?'—':((tr.buy_price||0)*100).toFixed(0)+'%'}</td>
+        <td style="font-weight:600">${st==='skipped'?'—':'$'+(tr.buy_amount||0).toFixed(2)}</td>
+        <td style="color:${slColor};font-weight:600">${st==='skipped'?'—':'T-'+sl+'s'}</td>
+        <td class="${pc}" style="font-weight:600;font-size:11px">${st==='skipped'?(tr.skip_reason||''):(st==='pending'?'-':((tr.net_profit>=0?'+':'')+'$'+Math.abs(tr.net_profit||0).toFixed(2)))}</td>
+        <td style="color:${roi>=0?'#3fb950':'#f85149'};font-size:11px">${st==='skipped'?'—':(roi>=0?'+':'')+roi.toFixed(1)+'%'}</td>
+      </tr>`;
+    });
+    html+='</tbody></table></div></div>';
+  }
+  c.innerHTML=html;
+}
+
+// ========== 操作函数 ==========
+function toggleBot(){
+  if(!confirm('确定启动/暂停交易机器人？')) return;
+  fetch('/api/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggle'})})
+    .then(r=>r.json()).then(d=>{
+      toast(d.paused?'⏸ 已暂停':'▶ 已启动'); loadData();
+    }).catch(()=>toast('操作失败'));
+}
+function resetCapital(){
+  const cfg={...(TRADER.config||{}),...pendingConfig};
+  const ic=cfg.initial_capital||1;
+  if(!confirm(`确定重置？资金→$${ic}，交易记录清空`)) return;
+  fetch('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(r=>r.json()).then(d=>{if(d.ok){toast(d.message);loadData()}}).catch(()=>toast('失败'));
+}
+function confirmLive(){
+  const overlay=document.createElement('div');
+  overlay.className='confirm-overlay';
+  overlay.innerHTML=`<div class="confirm-box"><h3>⚠️ 切换到实盘交易</h3><p>即将使用真实资金。请确认策略参数已充分验证。</p><div class="btns"><button class="ctrl-btn" onclick="this.closest('.confirm-overlay').remove()">取消</button><button class="ctrl-btn danger" onclick="setLiveMode()">确认切换到实盘</button></div></div>`;
+  document.body.appendChild(overlay);
+}
+function setLiveMode(){document.querySelector('.confirm-overlay').remove();setCfg('mode','live');saveConfig()}
+function loadDefaultStrategy(){
+  pendingConfig={entry_second:25,gap_threshold:10,min_buy_price:0.60,bet_fraction:1.0,withdraw_mode:'none',cooldown_seconds:0,initial_capital:1.0};
+  renderTrader();saveConfig();
+}
+function setCfg(k,v){pendingConfig[k]=v;renderTrader()}
+function saveConfig(){
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pendingConfig)})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok){pendingConfig={};TRADER.config=d.config;toast('✅ 配置已保存');document.getElementById('save-status').textContent='✅ '+new Date().toLocaleTimeString()}
+      else document.getElementById('save-status').textContent='❌ '+d.error;
+    }).catch(()=>document.getElementById('save-status').textContent='❌ 网络错误');
+}
+function exportCSV(){
+  if(!TRADER||!TRADER.recent_trades||!TRADER.recent_trades.length){toast('暂无交易记录');return}
+  const trades=TRADER.recent_trades;
+  const headers=['状态','时间','方向','开盘价','买入BTC','结算价','买入差','结算差','概率','投入','入场','盈亏','回报'];
+  const rows=trades.map(tr=>{
+    const st=tr.status==='skipped'?'跳过':(tr.status==='pending'?'等待':(tr.won?'赢':'亏'));
+    const setGap=(tr.btc_final&&tr.ptb)?(tr.btc_final-tr.ptb):0;
+    const roi=tr.buy_amount>0?(tr.net_profit/tr.buy_amount*100).toFixed(1)+'%':'';
+    return [st,(tr.time||'').substring(0,16),tr.direction,tr.ptb,tr.btc_entry,tr.btc_final,tr.entry_gap||tr.gap,setGap.toFixed(0),(tr.buy_price*100).toFixed(0)+'%',tr.buy_amount,tr.seconds_left,tr.net_profit?tr.net_profit.toFixed(2):0,roi];
+  });
+  const csv='\uFEFF'+[headers,...rows].map(r=>r.map(v=>'"'+v+'"').join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='btc5m_'+new Date().toISOString().substring(0,10)+'.csv';a.click();
+  toast('✅ 已导出'+trades.length+'条');
+}
+function toast(msg){
+  const fb=document.getElementById('feedback');
+  fb.textContent=msg;fb.classList.add('show');
+  setTimeout(()=>fb.classList.remove('show'),2500);
+}
+</script>
+</body>
+</html>

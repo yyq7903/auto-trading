@@ -1,0 +1,16 @@
+[Unit]
+Description=BTC 5M Data Collector
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/yyq/workspace/btc5m-collector
+ExecStart=/usr/bin/python3 /home/yyq/workspace/btc5m-collector/collect.py
+ExecStartPost=/bin/bash -c 'sleep 10 && /usr/bin/python3 /home/yyq/workspace/btc5m-webui/prepare.py'
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/yyq/workspace/btc5m-collector/collect.log
+StandardError=append:/home/yyq/workspace/btc5m-collector/collect.log
+
+[Install]
+WantedBy=default.target

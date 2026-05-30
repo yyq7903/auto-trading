@@ -1,0 +1,13 @@
+[Unit]
+Description=BTC 5M Live Trader (Browser Automation)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /mnt/c/Users/yyq/Desktop/自动交易/btc5m-trader/live/trader.py
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/mnt/c/Users/yyq/Desktop/自动交易/btc5m-trader
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=BTC 5M Data Collector
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/c/Users/yyq/Desktop/自动交易/btc5m-collector
+ExecStart=/usr/bin/python3 /mnt/c/Users/yyq/Desktop/自动交易/btc5m-collector/collect.py
+ExecStartPost=/bin/bash -c 'sleep 10 && /usr/bin/python3 /mnt/c/Users/yyq/Desktop/自动交易/btc5m-webui/prepare.py'
+Restart=always
+RestartSec=5
+StandardOutput=append:/mnt/c/Users/yyq/Desktop/自动交易/btc5m-collector/collect.log
+StandardError=append:/mnt/c/Users/yyq/Desktop/自动交易/btc5m-collector/collect.log
+
+[Install]
+WantedBy=default.target

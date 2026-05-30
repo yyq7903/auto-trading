@@ -1,0 +1,13 @@
+[Unit]
+Description=BTC 5M WebUI API Server
+
+[Service]
+ExecStart=/usr/bin/python3 /mnt/c/Users/yyq/Desktop/自动交易/btc5m-webui/api_server.py
+WorkingDirectory=/mnt/c/Users/yyq/Desktop/自动交易/btc5m-webui
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

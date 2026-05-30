@@ -1,0 +1,13 @@
+[Unit]
+Description=BTC 5M Sim Trader (Backtest & Simulation)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /mnt/c/Users/yyq/Desktop/自动交易/btc5m-trader/sim/trader.py
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/mnt/c/Users/yyq/Desktop/自动交易/btc5m-trader
+
+[Install]
+WantedBy=default.target

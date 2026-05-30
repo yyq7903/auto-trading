@@ -1,0 +1,19 @@
+{
+  "paused": false,
+  "entry_second": 25,
+  "gap_threshold": 10,
+  "min_buy_price": 0.60,
+  "bet_fraction": 1.0,
+  "withdraw_mode": "none",
+  "max_consecutive_losses": 1,
+  "cooldown_seconds": 0,
+  "initial_capital": 1.01,
+  "active_strategy": "1",
+  "strategies": {
+    "1": {"name": "策略一（默认）", "win_rate": 95.4, "params": {"entry_second": 25, "gap_threshold": 10, "min_buy_price": 0.60, "bet_fraction": 1.0, "cooldown_seconds": 0}},
+    "2": {"name": "策略二（稳健）", "win_rate": 100.0, "params": {"entry_second": 10, "gap_threshold": 50, "min_buy_price": 0.55, "bet_fraction": 0.5, "cooldown_seconds": 0}},
+    "3": {"name": "策略三（高收益）", "win_rate": 99.7, "params": {"entry_second": 10, "gap_threshold": 20, "min_buy_price": 0.60, "bet_fraction": 1.0, "cooldown_seconds": 0}},
+    "4": {"name": "策略四（平衡）", "win_rate": 99.2, "params": {"entry_second": 15, "gap_threshold": 30, "min_buy_price": 0.65, "bet_fraction": 0.5, "cooldown_seconds": 0}},
+    "5": {"name": "策略五（保守）", "win_rate": 98.9, "params": {"entry_second": 20, "gap_threshold": 30, "min_buy_price": 0.70, "bet_fraction": 0.25, "cooldown_seconds": 0}}
+  }
+}

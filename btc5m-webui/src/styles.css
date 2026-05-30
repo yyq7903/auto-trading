@@ -1,0 +1,316 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+  background: #0b1017;
+}
+
+.app-layout {
+  min-height: 100vh;
+  background: #0b1017;
+  color: #dbe6f3;
+}
+
+.topbar {
+  height: 60px;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  background: #121923;
+  border-bottom: 1px solid #263241;
+}
+
+.brand {
+  min-width: 310px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 22px;
+  font-weight: 700;
+  color: #5aa2ff;
+}
+
+.brand .ant-typography {
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.ticker {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 8px 14px;
+  border: 1px solid #263241;
+  border-radius: 6px;
+  background: #171f2b;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ticker b {
+  color: #ff9b54;
+}
+
+.content {
+  padding: 18px 24px 32px;
+}
+
+.panel {
+  background: #111922;
+  border: 1px solid #253241;
+  border-radius: 8px;
+}
+
+.panel .ant-card-head {
+  border-bottom-color: #263241;
+}
+
+.slot-grid {
+  width: 100%;
+}
+
+.slot {
+  width: 174px;
+  height: 92px;
+  border: 1px solid #293848;
+  border-radius: 8px;
+  background: #151f2b;
+  color: #dbe6f3;
+  text-align: left;
+  padding: 12px;
+  cursor: pointer;
+}
+
+.slot span,
+.slot small {
+  display: block;
+  color: #8392a5;
+}
+
+.slot b {
+  display: block;
+  margin: 6px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slot.active {
+  border-color: #2f8cff;
+  background: #162a43;
+  box-shadow: inset 0 0 0 1px #2f8cff;
+}
+
+.slot:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.slot.switching {
+  border-color: #f6b73c;
+}
+
+.param-form {
+  max-width: 960px;
+}
+
+.mode-card {
+  margin-top: 16px;
+  padding: 16px;
+  background: #151f2b;
+  border: 1px solid #263241;
+  border-radius: 8px;
+}
+
+.control-buttons {
+  width: 100%;
+  margin: 12px 0;
+}
+
+.wallet-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.wallet-actions {
+  margin-top: 12px;
+}
+
+.sim-funds-control {
+  width: 100%;
+  margin-top: 14px;
+}
+
+.sim-funds-control .ant-input-number {
+  width: 100%;
+}
+
+.wide-link {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.quality-compact {
+  padding: 0;
+}
+
+.quality-stats {
+  margin-top: 12px;
+}
+
+.chart {
+  width: 100%;
+  height: 300px;
+}
+
+.recent-card {
+  margin-top: 16px;
+}
+
+.market-card {
+  margin-top: 16px;
+}
+
+.market-list-card .ant-table-row {
+  cursor: pointer;
+}
+
+.selected-market-row > td {
+  background: rgba(47, 140, 255, 0.16) !important;
+}
+
+.market-stats-row {
+  margin-bottom: 8px;
+}
+
+.market-replay-chart {
+  width: 100%;
+  height: 430px;
+  margin-top: 12px;
+}
+
+.market-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #263241;
+}
+
+.green {
+  color: #2ac769;
+}
+
+.red {
+  color: #ff4d4f;
+}
+
+.orange {
+  color: #ff8a3d;
+}
+
+.strong {
+  font-weight: 700;
+}
+
+.market-id {
+  color: #3aa0ff;
+  font-variant-numeric: tabular-nums;
+}
+
+.recent-card .ant-table-cell {
+  font-variant-numeric: tabular-nums;
+}
+
+.full {
+  width: 100%;
+  margin-top: 16px;
+}
+
+.ant-table {
+  background: transparent;
+}
+
+.ant-tabs-nav {
+  margin-bottom: 16px !important;
+}
+
+.ant-statistic-title {
+  color: #8797aa !important;
+}
+
+.ant-descriptions-item-label {
+  color: #8797aa !important;
+}
+
+.ant-btn-link {
+  padding-inline: 0;
+}
+
+@media (max-width: 900px) {
+  .topbar {
+    height: auto;
+    padding: 12px;
+    flex-wrap: wrap;
+  }
+
+  .brand {
+    min-width: 100%;
+  }
+
+  .ticker {
+    width: 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+  }
+
+  .content {
+    padding: 12px;
+  }
+}
+
+/* 交易记录行颜色编码 */
+.row-won {
+  background-color: rgba(82, 196, 26, 0.1) !important;
+}
+.row-won:hover > td {
+  background-color: rgba(82, 196, 26, 0.2) !important;
+}
+.row-lost {
+  background-color: rgba(255, 77, 79, 0.1) !important;
+}
+.row-lost:hover > td {
+  background-color: rgba(255, 77, 79, 0.2) !important;
+}
+.row-skipped {
+  background-color: rgba(150, 150, 150, 0.05) !important;
+}
+.row-skipped:hover > td {
+  background-color: rgba(150, 150, 150, 0.1) !important;
+}
+.row-pending {
+  background-color: rgba(24, 144, 255, 0.1) !important;
+}
+.row-pending:hover > td {
+  background-color: rgba(24, 144, 255, 0.2) !important;
+}
+
+/* 策略概览 */
+.strategy-overview {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}

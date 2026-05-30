@@ -1,0 +1,10 @@
+{
+  "bankroll": 1.01,
+  "trade_count": 0,
+  "win_count": 0,
+  "loss_count": 0,
+  "total_withdrawn": 0.0,
+  "consecutive_losses": 0,
+  "cooldown_until": 0,
+  "executor_ready": true
+}

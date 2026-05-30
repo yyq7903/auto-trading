@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""
+BTC 5M Sim Trader — 纯模拟，不连接浏览器/钱包
+完全隔离：独立 config / state / trades / logs
+"""
+import os, sys, json, time, threading
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from shared.utils import log, log_trade, CN
+from shared.config import Config
+from shared.btc_price import get_btc, get_btc_fresh, btc_price_loop, extract_tokens, find_market, fetch_platform_crypto_price
+
+# === 路径 ===
+MODE = "sim"
+TRADER_DIR = Path(__file__).parent
+DATA_DIR = Path(f"/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/{MODE}")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = DATA_DIR / "state.json"
+NOTIFY_FILE = DATA_DIR / "notify.txt"
+
+ROOT_TRADES = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/trades.jsonl")
+
+# === 共享数据（只读） ===
+COLLECTOR_DATA = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/shared")
+MARKETS_FILE = COLLECTOR_DATA / "markets.jsonl"
+TRUE_MARKET_DIR = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/true_market")
+WINDOWS_FILE = TRUE_MARKET_DIR / "windows.jsonl"
+ORDERBOOK_TICKS_FILE = TRUE_MARKET_DIR / "orderbook_ticks.jsonl"
+
+# === 运行时状态 ===
+config = Config(str(TRADER_DIR))
+cfg = config.data
+bankroll = 1.0  # 默认值，会被 config.initial_capital 覆盖
+trade_count = 0
+win_count = 0
+loss_count = 0
+total_withdrawn = 0.0
+consecutive_losses = 0
+cooldown_until = 0
+btc_price = 0.0
+platform_open_cache = {}
+
+
+def load_state():
+    global bankroll, trade_count, win_count, loss_count, total_withdrawn, consecutive_losses, cooldown_until
+    state = config.load_state()
+    bankroll = state.get("bankroll", float(cfg.get("initial_capital", 1.0)))
+    trade_count = state.get("trade_count", 0)
+    win_count = state.get("win_count", 0)
+    loss_count = state.get("loss_count", 0)
+    total_withdrawn = state.get("total_withdrawn", 0.0)
+    consecutive_losses = state.get("consecutive_losses", 0)
+    cooldown_until = state.get("cooldown_until", 0)
+    log(f"状态已加载: ${bankroll:.2f}/{trade_count}笔 ({win_count}W/{loss_count}L)", MODE)
+
+
+def save_state():
+    state = {
+        "bankroll": bankroll, "trade_count": trade_count,
+        "win_count": win_count, "loss_count": loss_count,
+        "total_withdrawn": total_withdrawn,
+        "consecutive_losses": consecutive_losses,
+        "cooldown_until": cooldown_until,
+    }
+    config.save_state(state)
+    try:
+        # 更新 legacy trader_state.json
+        root_state = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/trader_state.json")
+        with open(root_state, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        # 更新 WebUI 的 sim/state.json（嵌套结构）
+        webui_state = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/sim/state.json")
+        webui_state.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        try:
+            with open(webui_state) as f:
+                existing = json.load(f)
+        except:
+            pass
+        existing["sim_state"] = state
+        existing["last_update"] = datetime.now(CN).isoformat()
+        with open(webui_state, "w") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+    except:
+        pass
+
+
+def load_markets() -> list:
+    """加载市场数据，优先从 true_market/windows.jsonl 读取（取最后一条有效记录）"""
+    markets_dict = {}
+    try:
+        if WINDOWS_FILE.exists():
+            with open(WINDOWS_FILE) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("source") not in ("polymarket_gamma", "ptb_retry_fill"):
+                            continue
+                        slug = d.get("slug", "")
+                        if not slug:
+                            continue
+                        prices = {}
+                        outcome_prices = d.get("outcome_prices", "[]")
+                        if outcome_prices is None:
+                            outcome_prices = "[]"
+                        if isinstance(outcome_prices, str):
+                            try:
+                                op = json.loads(outcome_prices)
+                                if len(op) >= 2:
+                                    tid_up = d.get("token_up", "")
+                                    tid_down = d.get("token_down", "")
+                                    if tid_up:
+                                        prices[tid_up] = float(op[0])
+                                    if tid_down:
+                                        prices[tid_down] = float(op[1])
+                            except:
+                                pass
+                        # 后面的记录覆盖前面的（取最新数据）
+                        existing = markets_dict.get(slug, {})
+                        ptb = d.get("ptb") or existing.get("priceToBeat", 0)
+                        if not prices:
+                            prices = existing.get("prices", {})
+                        if not d.get("token_up"):
+                            token_up = existing.get("token_up", "")
+                            token_down = existing.get("token_down", "")
+                        else:
+                            token_up = d.get("token_up", "")
+                            token_down = d.get("token_down", "")
+                        markets_dict[slug] = {
+                            "slug": slug,
+                            "priceToBeat": ptb,
+                            "token_up": token_up,
+                            "token_down": token_down,
+                            "prices": prices,
+                            "closed": d.get("closed", False),
+                        }
+                    except:
+                        pass
+    except:
+        pass
+    markets = list(markets_dict.values())
+    if markets:
+        return markets
+    
+    # 回退到 markets.jsonl
+    try:
+        if MARKETS_FILE.exists():
+            with open(MARKETS_FILE) as f:
+                return [json.loads(l) for l in f if l.strip()]
+    except:
+        pass
+    return []
+
+
+def fetch_ptb(slug: str) -> float:
+    """从 true_market/windows.jsonl 获取 PTB（取最后一条有效记录）"""
+    best_ptb = 0.0
+    try:
+        if WINDOWS_FILE.exists():
+            with open(WINDOWS_FILE) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("slug") != slug:
+                            continue
+                        src = d.get("source", "")
+                        if src not in ("polymarket_gamma", "ptb_retry_fill", "platform_validation"):
+                            continue
+                        ptb = d.get("ptb") or d.get("platform_ptb") or d.get("our_ptb") or 0
+                        if ptb and float(ptb) > 0:
+                            best_ptb = float(ptb)
+                    except:
+                        pass
+    except:
+        pass
+    return best_ptb
+    
+    # 回退到 markets.jsonl
+    try:
+        if MARKETS_FILE.exists():
+            with open(MARKETS_FILE) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if d.get("slug") == slug and d.get("type") == "market_open":
+                            ptb = d.get("priceToBeat", 0)
+                            if ptb and ptb > 0:
+                                return float(ptb)
+                    except:
+                        pass
+    except:
+        pass
+    return 0.0
+
+
+def parse_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except:
+        return default
+
+
+def fetch_platform_open_cached(window_start_ts: int, window_end_ts: int) -> float:
+    """Use Polymarket's official open price for the current 5m market."""
+    now = time.time()
+    cached = platform_open_cache.get(window_start_ts)
+    if cached and cached.get("open_price", 0) > 0:
+        return float(cached["open_price"])
+    if cached and now - cached.get("checked_at", 0) < 2:
+        return 0.0
+
+    platform_price = fetch_platform_crypto_price(
+        window_start_ts,
+        window_end_ts,
+        max_retries=1,
+        retry_interval=0,
+    )
+    open_price = platform_price.get("openPrice") or 0
+    platform_open_cache[window_start_ts] = {
+        "open_price": float(open_price or 0),
+        "checked_at": now,
+        "source": platform_price.get("source", ""),
+    }
+    return float(open_price or 0)
+
+
+def tail_jsonl(path: Path, n=300):
+    if not path.exists():
+        return []
+    try:
+        import subprocess
+        r = subprocess.run(["tail", "-n", str(n), str(path)], capture_output=True, text=True, timeout=3)
+        rows = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except:
+                pass
+        return rows
+    except:
+        return []
+
+
+def _side_quote(side_data: dict, sim_data: dict | None = None):
+    side_data = side_data if isinstance(side_data, dict) else {}
+    bids = side_data.get("bids", []) if isinstance(side_data.get("bids"), list) else []
+    asks = side_data.get("asks", []) if isinstance(side_data.get("asks"), list) else []
+    bid = parse_float(side_data.get("bid1_price"), 0)
+    ask = parse_float(side_data.get("ask1_price"), 0)
+    if bid <= 0 and bids:
+        bid = parse_float((bids[0] or {}).get("price"), 0)
+    if ask <= 0 and asks:
+        ask = parse_float((asks[0] or {}).get("price"), 0)
+    mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else ask or bid or 0
+    sim_data = sim_data if isinstance(sim_data, dict) else {}
+    avg_fill = parse_float(sim_data.get("simulated_avg_fill_price"), 0)
+    fill_quality = sim_data.get("fill_quality", "")
+    # 只用模拟成交均价或 ask 作为概率。ask=0 意味着没有卖单，不能成交
+    probability = avg_fill if avg_fill > 0 and fill_quality in ("full", "partial") else 0
+    return {
+        "probability": probability,
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "avg_fill": avg_fill,
+        "fill_quality": fill_quality,
+    }
+
+
+def latest_entry_quote(slug: str, direction: str, max_age_seconds=15):
+    """取入场时最新盘口概率，避免使用市场开盘 outcome_prices。"""
+    side_key = "up" if direction.lower() == "up" else "down"
+    sim_key = f"{side_key}_sim"
+    now = datetime.now(timezone.utc)
+    allowed_reasons = {"market_open", "periodic", "periodic_1s", "pre_close_1s"}
+    for row in reversed(tail_jsonl(ORDERBOOK_TICKS_FILE, 2000)):
+        if row.get("slug") != slug:
+            continue
+        if row.get("reason") not in allowed_reasons:
+            continue
+        age = None
+        try:
+            ts = datetime.fromisoformat(str(row.get("received_at") or row.get("server_ts") or "").replace("Z", "+00:00"))
+            age = (now - ts).total_seconds()
+        except:
+            pass
+        if age is not None and age > max_age_seconds:
+            continue
+        if isinstance(row.get(side_key), dict) and isinstance(row.get(sim_key), dict):
+            quote = _side_quote(row.get(side_key), row.get(sim_key))
+            if quote["probability"] > 0 and quote.get("fill_quality") in ("full", "partial"):
+                quote["source"] = row.get("reason", "orderbook_snapshot")
+                quote["age_seconds"] = round(age, 3) if age is not None else None
+                return quote
+    return {"probability": 0, "source": "missing_orderbook", "age_seconds": None}
+
+
+
+def record_skip(slug, reason, current_5m, btc_price=0, ptb=0, gap=0, buy_price=0, direction="none", quote=None, monitor=None):
+    """记录跳过的市场"""
+    now_ts = int(time.time())
+    window_end_ts = current_5m + 300
+    remaining = window_end_ts - now_ts
+    entry_seconds_before = max(0, remaining)
+    market_time_short = datetime.fromtimestamp(current_5m, CN).strftime("%m-%d %H:%M") + "-" + datetime.fromtimestamp(window_end_ts, CN).strftime("%H:%M")
+    quote = quote or {}
+    monitor = monitor or {}
+    record = {
+        "slug": slug,
+        "time": datetime.now(CN).isoformat(),
+        "mode": "sim",
+        "direction": direction if direction in ("Up", "Down") else "none",
+        "settlement_direction": None,
+        "market_slug": slug,
+        "window_start_ts": current_5m,
+        "window_end_ts": window_end_ts,
+        "market_time": market_time_short,
+        "market_time_short": market_time_short,
+        "actual_entry_ts": now_ts,
+        "entry_seconds_before": entry_seconds_before,
+        "open_price": round(ptb, 2) if ptb else None,
+        "platform_open_price": round(ptb, 2) if ptb else None,
+        "btc_entry": round(btc_price, 2) if btc_price else None,
+        "btc_final": None,
+        "platform_close_price": None,
+        "entry_gap": round(gap, 2) if gap else None,
+        "buy_gap": round(gap, 2) if gap else None,
+        "settlement_gap": None,
+        "close_gap": None,
+        "probability": buy_price if buy_price else None,
+        "entry_probability": buy_price if buy_price else None,
+        "probability_source": quote.get("source", ""),
+        "probability_age_seconds": quote.get("age_seconds"),
+        "best_bid": quote.get("bid"),
+        "best_ask": quote.get("ask"),
+        "avg_fill_price": quote.get("avg_fill"),
+        "fill_quality": quote.get("fill_quality"),
+        "amount": 0,
+        "pnl": 0,
+        "return": 0,
+        "settlement_status": "skipped",
+        "settle_source": "",
+        "settle_confirmed_at": None,
+        "skip_reason": reason,
+        "exclude_from_backtest": True,
+        "status": "skipped",
+        "monitor_window_seconds": monitor.get("window_seconds"),
+        "monitor_started_at": monitor.get("started_at"),
+        "monitor_evaluations": monitor.get("evaluations"),
+        "best_probability_seen": monitor.get("best_probability"),
+        "best_gap_seen": monitor.get("best_gap"),
+    }
+    log_trade(record, MODE)
+    try:
+        with open(ROOT_TRADES, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except:
+        pass
+
+
+def notify(msg):
+    with open(NOTIFY_FILE, "a") as f:
+        f.write(f"[{datetime.now(CN).strftime('%H:%M:%S')}] {msg}\n")
+    log(f"📢 {msg}", MODE)
+
+
+# ===== 结算旧记录 =====
+_last_settle_scan = 0
+
+def settle_old_records():
+    """扫描 trades.jsonl 中未结算的旧记录，获取平台结算价"""
+    global _last_settle_scan
+    now = time.time()
+    # 每 10 秒扫描一次
+    if now - _last_settle_scan < 10:
+        return
+    _last_settle_scan = now
+    
+    try:
+        if not ROOT_TRADES.exists():
+            return
+        with open(ROOT_TRADES, "r") as f:
+            lines = f.readlines()
+        
+        updated = False
+        settled_count = 0
+        for i, line in enumerate(lines):
+            # 每次最多结算 1 条，避免阻塞主循环
+            if settled_count >= 1:
+                break
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            # 只处理 skipped 或 pending 且没有结算价的记录
+            if record.get("settlement_status") not in ("skipped", "pending"):
+                continue
+            if record.get("btc_final") is not None:
+                continue
+            # 检查窗口是否已结束（至少过了 30 秒）
+            window_end = record.get("window_end_ts", 0)
+            if window_end <= 0 or now < window_end + 30:
+                continue
+            
+            # 获取结算价
+            window_start = record.get("window_start_ts", 0)
+            try:
+                platform_price = fetch_platform_crypto_price(window_start, window_end, max_retries=2, retry_interval=0.5)
+                btc_final = platform_price.get("closePrice")
+                if btc_final and btc_final > 0:
+                    open_price = record.get("open_price", 0) or 0
+                    if open_price > 0:
+                        actual_winner = "Up" if btc_final >= open_price else "Down"
+                    else:
+                        actual_winner = ""
+                    record["btc_final"] = round(btc_final, 2)
+                    record["platform_close_price"] = round(btc_final, 2)
+                    if open_price > 0:
+                        record["settlement_gap"] = round(btc_final - open_price, 2)
+                        record["close_gap"] = round(btc_final - open_price, 2)
+                    record["settlement_direction"] = actual_winner
+                    record["settle_source"] = platform_price.get("source", "")
+                    record["settle_confirmed_at"] = datetime.now(CN).isoformat()
+                    lines[i] = json.dumps(record, ensure_ascii=False) + "\n"
+                    updated = True
+                    log(f"✅ 结算价更新: {record.get('slug')} close=${btc_final:,.2f} winner={actual_winner}", MODE)
+                    settled_count += 1
+            except Exception as e:
+                log(f"⚠️ 结算价获取失败 {record.get('slug')}: {e}", MODE)
+        
+        if updated:
+            with open(ROOT_TRADES, "w") as f:
+                f.writelines(lines)
+    except Exception as e:
+        log(f"⚠️ 结算扫描错误: {e}", MODE)
+
+
+# ===== 主循环 =====
+def main():
+    global cfg, btc_price, bankroll, trade_count, win_count, loss_count, consecutive_losses, cooldown_until
+
+    log("=" * 50, MODE)
+    log("BTC 5M SIM TRADER", MODE)
+    log("模式: 纯模拟 · 不连接浏览器 · 不真实下单", MODE)
+    log("=" * 50, MODE)
+
+    config.load()
+    load_state()
+
+    # 启动价格线程
+    threading.Thread(target=btc_price_loop, daemon=True).start()
+
+    time.sleep(2)
+    btc_price = get_btc()
+
+    processed = set()
+    pending_settlements = {}  # slug -> record_path
+    monitor_state = {}
+
+    while True:
+        try:
+            # 每次循环都检查旧记录结算
+            settle_old_records()
+            
+            config.load()
+            cfg = config.data
+
+            now = int(time.time())
+            current_5m = (now // 300) * 300
+            slug = f"btc-updown-5m-{current_5m}"
+            remaining = current_5m + 300 - now
+
+            for old_slug, state in list(monitor_state.items()):
+                if old_slug != slug and old_slug not in processed:
+                    record_skip(
+                        old_slug,
+                        state.get("last_reason", "entry_window_ended_without_signal"),
+                        state.get("current_5m", current_5m - 300),
+                        state.get("btc_price", 0),
+                        state.get("ptb", 0),
+                        state.get("gap", 0),
+                        state.get("buy_price", 0),
+                        state.get("direction", "none"),
+                        state.get("quote", {}),
+                        state,
+                    )
+                    processed.add(old_slug)
+                    monitor_state.pop(old_slug, None)
+
+            if cfg.get("paused", False):
+                time.sleep(5)
+                continue
+            if cooldown_until > now:
+                time.sleep(3)
+                continue
+            if slug in processed:
+                time.sleep(0.5)
+                continue
+
+            entry_window_seconds = max(1, min(120, int(float(cfg.get("entry_second", 25)))))
+            if remaining > entry_window_seconds:
+                # 睡到入场窗口开始，但最多睡 2 秒避免错过
+                time.sleep(min(max(remaining - entry_window_seconds, 0.2), 2))
+                continue
+            if remaining <= 0:
+                # 窗口结束，记录跳过原因
+                monitor = monitor_state.get(slug, {})
+                last_reason = monitor.get("last_reason", "窗口结束未触发入场")
+                if last_reason == "waiting_for_signal":
+                    # 如果没有具体的失败原因，检查是否有数据
+                    if monitor.get("best_probability", 0) > 0:
+                        last_reason = f"概率{monitor['best_probability']:.0%}不足"
+                    elif monitor.get("best_gap", 0) > 0:
+                        last_reason = f"价差${monitor['best_gap']:.0f}不足"
+                    else:
+                        last_reason = "窗口结束未触发入场"
+                log(f"⏭ {slug} {last_reason} 跳过", MODE, tag="SIM")
+                record_skip(slug, last_reason, current_5m, 
+                           monitor.get("btc_price", 0), 
+                           monitor.get("ptb", 0), 
+                           monitor.get("gap", 0), 
+                           monitor.get("buy_price", 0),
+                           monitor.get("direction", "none"),
+                           monitor.get("quote", {}),
+                           monitor)
+                processed.add(slug)
+                monitor_state.pop(slug, None)
+                time.sleep(0.2)
+                continue
+
+            monitor = monitor_state.setdefault(slug, {
+                "current_5m": current_5m,
+                "window_seconds": entry_window_seconds,
+                "started_at": datetime.now(CN).isoformat(),
+                "evaluations": 0,
+                "best_probability": 0,
+                "best_gap": 0,
+                "last_reason": "waiting_for_signal",
+            })
+            monitor["window_seconds"] = entry_window_seconds
+            monitor["evaluations"] = int(monitor.get("evaluations", 0)) + 1
+
+            # 加载市场
+            markets = load_markets()
+
+            # 获取PTB
+            window_end_ts = current_5m + 300
+            ptb = fetch_platform_open_cached(current_5m, window_end_ts)
+            ptb_source = "platform_open"
+            if ptb <= 0:
+                ptb_source = "collector_fallback"
+                ptb = fetch_ptb(slug)
+            if ptb <= 0:
+                m = find_market(markets, slug)
+                ptb = float(m.get("priceToBeat", 0))
+            if ptb <= 0:
+                monitor["last_reason"] = "PTB未获取到"
+                if remaining <= 1:
+                    record_skip(slug, monitor["last_reason"], current_5m, monitor=monitor)
+                    processed.add(slug)
+                    monitor_state.pop(slug, None)
+                time.sleep(0.1)
+                continue
+
+            btc_price = get_btc()
+            if btc_price <= 0:
+                monitor["last_reason"] = "BTC现价未获取到"
+                time.sleep(0.1)
+                continue
+
+            gap = btc_price - ptb
+
+            # 计算方向和概率
+            direction = "Up" if gap > 0 else "Down"
+            quote = latest_entry_quote(slug, direction, max_age_seconds=15)
+            buy_price = quote.get("probability", 0) or 0
+
+            # 如果当前方向概率太低（< min_buy_price），尝试反向
+            if False and buy_price > 0 and buy_price < cfg["min_buy_price"]:
+                reverse_dir = "Down" if direction == "Up" else "Up"
+                reverse_quote = latest_entry_quote(slug, reverse_dir, max_age_seconds=15)
+                reverse_price = reverse_quote.get("probability", 0) or 0
+                if reverse_price > buy_price and reverse_price > cfg["min_buy_price"]:
+                    log(f"🔄 {slug} {direction}概率{buy_price:.0%}太低，改买{reverse_dir}概率{reverse_price:.0%}", MODE, tag="SIM")
+                    direction = reverse_dir
+                    buy_price = reverse_price
+                    quote = reverse_quote
+
+            # 只有盘口暂时缺失时才回退到市场元数据，且显式标记，避免误以为是入场秒级概率。
+            if False and buy_price <= 0:
+                m = find_market(markets, slug)
+                tid_up, tid_down = extract_tokens(m)
+                prices = m.get("prices", {})
+                if prices and len(prices) > 0:
+                    key = tid_up if direction == "Up" else tid_down
+                    buy_price = prices.get(key, 0)
+                    if buy_price <= 0:
+                        # 如果找不到对应 token，尝试用第一个/第二个价格
+                        price_list = list(prices.values())
+                        if len(price_list) >= 2:
+                            buy_price = price_list[0] if direction == "Up" else price_list[1]
+                    quote = {"source": "market_open_fallback", "age_seconds": None, "probability": buy_price}
+                else:
+                    # prices 为空，尝试直接从 market 数据获取 outcomePrices
+                    outcome_prices_raw = m.get("outcome_prices", "[]")
+                    if outcome_prices_raw is None:
+                        outcome_prices_raw = "[]"
+                    try:
+                        op = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+                        if len(op) >= 2:
+                            buy_price = float(op[0]) if direction == "Up" else float(op[1])
+                            quote = {"source": "market_open_fallback", "age_seconds": None, "probability": buy_price}
+                    except:
+                        pass
+                    log(f"DEBUG fallback: slug={slug} dir={direction} tid_up={tid_up[:10]}... tid_down={tid_down[:10]}... prices={prices} buy_price={buy_price}", MODE)
+
+            monitor.update({
+                "btc_price": btc_price,
+                "ptb": ptb,
+                "gap": gap,
+                "buy_price": buy_price,
+                "direction": direction,
+                "quote": quote,
+            })
+            if abs(gap) > abs(float(monitor.get("best_gap", 0) or 0)):
+                monitor["best_gap"] = round(gap, 2)
+            if buy_price and buy_price > float(monitor.get("best_probability", 0) or 0):
+                monitor["best_probability"] = round(buy_price, 4)
+
+            if abs(gap) < cfg["gap_threshold"]:
+                monitor["last_reason"] = f"gap=${gap:+,.0f}<${cfg['gap_threshold']}"
+                if remaining <= 1:
+                    log(f"⏭ {slug} {monitor['last_reason']} 跳过", MODE, tag="SIM")
+                    record_skip(slug, monitor["last_reason"], current_5m, btc_price, ptb, gap, buy_price, direction, quote, monitor)
+                    processed.add(slug)
+                    monitor_state.pop(slug, None)
+                time.sleep(0.1)
+                continue
+
+            if buy_price <= 0 or buy_price > 0.99:
+                monitor["last_reason"] = f"价格{buy_price:.3f}不可执行"
+                if remaining <= 1:
+                    log(f"⏭ {slug} {monitor['last_reason']} 跳过", MODE, tag="SIM")
+                    record_skip(slug, monitor["last_reason"], current_5m, btc_price, ptb, gap, buy_price, direction, quote, monitor)
+                    processed.add(slug)
+                    monitor_state.pop(slug, None)
+                time.sleep(0.1)
+                continue
+            if buy_price < cfg["min_buy_price"]:
+                monitor["last_reason"] = f"概率{buy_price:.0%}<{cfg['min_buy_price']:.0%}"
+                if remaining <= 1:
+                    log(f"⏭ {slug} {monitor['last_reason']} 跳过", MODE, tag="SIM")
+                    record_skip(slug, monitor["last_reason"], current_5m, btc_price, ptb, gap, buy_price, direction, quote, monitor)
+                    processed.add(slug)
+                    monitor_state.pop(slug, None)
+                time.sleep(0.1)
+                continue
+
+            # === 流动性检查：必须有真实卖单才能成交 ===
+            fill_quality = quote.get("fill_quality", "none")
+            best_ask = quote.get("ask", 0) or 0
+            if fill_quality != "full" or best_ask <= 0:
+                monitor["last_reason"] = f"无流动性(fill={fill_quality},ask={best_ask})"
+                if remaining <= 1:
+                    log(f"⏭ {slug} {monitor['last_reason']} 跳过", MODE, tag="SIM")
+                    record_skip(slug, monitor["last_reason"], current_5m, btc_price, ptb, gap, buy_price, direction, quote, monitor)
+                    processed.add(slug)
+                    monitor_state.pop(slug, None)
+                time.sleep(0.1)
+                continue
+
+            # === 模拟下单 ===
+            actual_entry_ts = int(time.time())
+            entry_seconds_before = max(0, current_5m + 300 - actual_entry_ts)
+            entry_time = datetime.fromtimestamp(actual_entry_ts, CN).isoformat()
+            entry_btc_price = get_btc() or btc_price
+            entry_open_price = fetch_platform_open_cached(current_5m, window_end_ts) or ptb
+            entry_gap = entry_btc_price - entry_open_price
+            entry_direction = "Up" if entry_gap > 0 else "Down"
+            if entry_direction != direction or abs(entry_gap) < cfg["gap_threshold"]:
+                monitor["last_reason"] = f"entry_recheck_failed gap=${entry_gap:+,.2f} dir={entry_direction}"
+                time.sleep(0.1)
+                continue
+            btc_price = entry_btc_price
+            ptb = entry_open_price
+            gap = entry_gap
+            bet_size = bankroll * cfg["bet_fraction"]
+            log(f"🎯 {slug} {direction} gap=${gap:+,.0f} @{buy_price:.3f} 下注${bet_size:.2f} T-{entry_seconds_before}s", MODE, tag="SIM")
+
+            # 模拟结果：从 Polymarket 平台获取官方结算价
+            window_end_ts = current_5m + 300
+            platform_price = fetch_platform_crypto_price(current_5m, window_end_ts, max_retries=300, retry_interval=2.0)
+            
+            btc_final = platform_price.get("closePrice")
+            open_price = platform_price.get("openPrice") or ptb
+            settle_source = platform_price.get("source", "unknown")
+            
+            if btc_final is None or btc_final <= 0:
+                # 平台结算价未返回，标记为待结算
+                log(f"⚠️ 平台结算价未返回，标记为 pending: {slug}", MODE, tag="SIM")
+                record = {
+                    "slug": slug, "time": entry_time,
+                    "entry_time": entry_time,
+                    "mode": "sim", "direction": direction,
+                    "market_slug": slug,
+                    "window_start_ts": current_5m,
+                    "window_end_ts": window_end_ts,
+                    "actual_entry_ts": actual_entry_ts,
+                    "entry_seconds_before": entry_seconds_before,
+                    "market_time": datetime.fromtimestamp(current_5m, CN).strftime("%m-%d %H:%M") + "-" + datetime.fromtimestamp(window_end_ts, CN).strftime("%H:%M"),
+                    "open_price": round(open_price, 2),
+                    "platform_open_price": round(open_price, 2),
+                    "btc_entry": round(entry_btc_price, 2),
+                    "btc_final": None,
+                    "platform_close_price": None,
+                    "entry_gap": round(entry_gap, 2),
+                    "buy_gap": round(entry_gap, 2),
+                    "settlement_gap": None,
+                    "close_gap": None,
+                    "probability": buy_price,
+                    "entry_probability": buy_price,
+                    "probability_source": quote.get("source", ""),
+                    "probability_age_seconds": quote.get("age_seconds"),
+                    "best_bid": quote.get("bid"),
+                    "best_ask": quote.get("ask"),
+                    "avg_fill_price": quote.get("avg_fill"),
+                    "fill_quality": quote.get("fill_quality"),
+                    "amount": bet_size,
+                    "pnl": None,
+                    "return": None,
+                    "settlement_status": "pending",
+                    "settle_source": settle_source,
+                    "settle_confirmed_at": None,
+                    "skip_reason": "platform_close_price_missing",
+                    "exclude_from_backtest": True,
+                    "status": "pending",
+                    "monitor_window_seconds": entry_window_seconds,
+                    "monitor_started_at": monitor.get("started_at"),
+                    "monitor_evaluations": monitor.get("evaluations"),
+                    "best_probability_seen": monitor.get("best_probability"),
+                    "best_gap_seen": monitor.get("best_gap"),
+                }
+                log_trade(record, MODE)
+                try:
+                    with open(ROOT_TRADES, "a") as f:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                except:
+                    pass
+                processed.add(slug)
+                monitor_state.pop(slug, None)
+                continue
+            
+            # 正确的胜负判断规则：最终价 >= 开盘价则 Up 赢
+            actual_winner = "Up" if btc_final >= open_price else "Down"
+            won = (direction == actual_winner)
+            
+            if won:
+                profit = bet_size * (1 - buy_price) / buy_price
+                bankroll += profit
+                win_count += 1
+                consecutive_losses = 0
+                log(f"✅ 获胜! +${profit:.2f} 余额=${bankroll:.2f}", MODE, tag="SIM")
+            else:
+                loss = bet_size
+                bankroll -= loss
+                loss_count += 1
+                consecutive_losses += 1
+                log(f"❌ 亏损! -${loss:.2f} 余额=${bankroll:.2f}", MODE, tag="SIM")
+
+            trade_count += 1
+
+            settle_confirmed_at = datetime.now(CN).isoformat()
+            record = {
+                "slug": slug, "time": entry_time,
+                "entry_time": entry_time,
+                "mode": "sim", "direction": direction,
+                "actual_winner": actual_winner,
+                "market_slug": slug,
+                "window_start_ts": current_5m,
+                "window_end_ts": window_end_ts,
+                "actual_entry_ts": actual_entry_ts,
+                "entry_seconds_before": entry_seconds_before,
+                "market_time": datetime.fromtimestamp(current_5m, CN).strftime("%m-%d %H:%M") + "-" + datetime.fromtimestamp(window_end_ts, CN).strftime("%H:%M"),
+                "open_price": round(open_price, 2),
+                "platform_open_price": round(open_price, 2),
+                "btc_entry": round(entry_btc_price, 2),
+                "btc_final": round(btc_final, 2),
+                "platform_close_price": round(btc_final, 2),
+                "entry_gap": round(entry_gap, 2),
+                "buy_gap": round(entry_gap, 2),
+                "settlement_gap": round(btc_final - open_price, 2),
+                "close_gap": round(btc_final - open_price, 2),
+                "probability": buy_price,
+                "entry_probability": buy_price,
+                "probability_source": quote.get("source", ""),
+                "probability_age_seconds": quote.get("age_seconds"),
+                "best_bid": quote.get("bid"),
+                "best_ask": quote.get("ask"),
+                "avg_fill_price": quote.get("avg_fill"),
+                "fill_quality": quote.get("fill_quality"),
+                "amount": bet_size,
+                "pnl": round(profit if won else -loss, 2),
+                "return": round((profit if won else -loss) / bet_size, 4),
+                "settlement_status": "confirmed",
+                "settle_source": settle_source,
+                "settle_confirmed_at": settle_confirmed_at,
+                "skip_reason": "",
+                "exclude_from_backtest": False,
+                "status": "won" if won else "lost",
+                "monitor_window_seconds": entry_window_seconds,
+                "monitor_started_at": monitor.get("started_at"),
+                "monitor_evaluations": monitor.get("evaluations"),
+                "best_probability_seen": monitor.get("best_probability"),
+                "best_gap_seen": monitor.get("best_gap"),
+            }
+            log_trade(record, MODE)
+            try:
+                with open(ROOT_TRADES, "a") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except:
+                pass
+            save_state()
+            processed.add(slug)
+            monitor_state.pop(slug, None)
+
+
+        except KeyboardInterrupt:
+            log("🛑 停止", MODE)
+            break
+        except Exception as e:
+            log(f"⚠️ 异常: {e}", MODE)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
