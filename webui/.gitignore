@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Screenshots (too large)
+截图/
+
+# Test scripts
+*_test.py
+*_comprehensive_test.py
+verify_fix.py
+
+# Environment variables
+.env
+*.env
+
+# System files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs
+*.log

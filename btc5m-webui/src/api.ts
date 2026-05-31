@@ -1,4 +1,4 @@
-import type { BackendEventsResponse, DataQualityState, MarketDetail, MarketWindowRow, SafetyState, StatusState, StrategyConfig, SummaryState, TradesResponse, WalletState } from "./types";
+import type { AnalyticsState, BackendEventsResponse, DataQualityState, MarketDetail, MarketWindowRow, SafetyState, StatusState, StrategyConfig, SummaryState, TradesResponse, WalletState } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {
@@ -60,4 +60,5 @@ export const api = {
   skipReasons: () => request<{data: Array<{name: string, value: number}>, total: number}>("/api/skip-reasons"),
   marketWindows: () => request<{markets: MarketWindowRow[]}>("/api/market-windows?limit=180"),
   marketDetail: (slug: string) => request<MarketDetail>(`/api/market-detail?slug=${encodeURIComponent(slug)}`),
+  analytics: () => request<AnalyticsState>("/api/analytics"),
 };

@@ -4,6 +4,8 @@ export type StrategyParams = {
   min_buy_price: number;
   bet_fraction: number;
   cooldown_seconds: number;
+  direction_filter?: "both" | "up" | "down";
+  fund_mode?: "fixed" | "amount";
 };
 
 export type Strategy = {
@@ -136,12 +138,45 @@ export type TradingStats = {
 
 export type SummaryState = {
   total: number;
+  confirmed?: number;
+  pending?: number;
+  excluded?: number;
   won: number;
   lost: number;
   skipped: number;
   failed: number;
+  win_rate?: number;
   total_pnl: number;
+  total_amount?: number;
   daily_summary: DailySummary[];
+};
+
+export type AnalyticsState = {
+  streak: {
+    current: number;
+    longest: number;
+    avg_length: number;
+  };
+  signal: {
+    direction: "up" | "down" | "none";
+    probability: number;
+    gap: number;
+    confidence: string;
+  };
+  today: {
+    markets: number;
+    expected_markets: number;
+    missing_markets: number;
+    trades: number;
+    wins: number;
+    losses: number;
+    win_rate: number;
+    pnl_sim: number;
+    pnl_live: number;
+    trade_count_sim: number;
+    trade_count_live: number;
+  };
+  total_markets: number;
 };
 
 export type DailySummary = {
