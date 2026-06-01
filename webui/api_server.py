@@ -47,6 +47,9 @@ LH = {"ok": False}; LH_at = 0.0
 PRICE_CACHE = {"value": 0.0, "at": 0.0, "source": ""}
 PLATFORM_PRICE_CACHE = {}
 TICK_DATA_CACHE = {}
+TRADES_CACHE = {}
+WINDOWS_CACHE = {}
+RESOLUTION_CACHE = {}
 LINE_COUNT_CACHE = {}
 WALLET_CACHE = {"at": 0.0, "data": None}
 SERVICE_CACHE = {}
@@ -115,6 +118,13 @@ def tail_jsonl(path, n=200):
         except Exception:
             pass
     return rows
+
+def file_sig(path):
+    try:
+        st = path.stat()
+        return (st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+    except Exception:
+        return (0, 0)
 
 def last_jsonl(p):
     rows = tail_jsonl(p, 1)
@@ -611,6 +621,11 @@ def clh():
 def read_trades():
     fp = D / "trades.jsonl"
     if not fp.exists(): return []
+    now = time.time()
+    sig = file_sig(fp)
+    cached = TRADES_CACHE.get("data")
+    if cached is not None and TRADES_CACHE.get("sig") == sig and now - TRADES_CACHE.get("at", 0) < 3:
+        return list(cached)
     trades = []
     with open(fp,"r",encoding="utf-8-sig") as f:
         for line in f:
@@ -618,7 +633,8 @@ def read_trades():
             if line:
                 try: trades.append(json.loads(line))
                 except: pass
-    return trades
+    TRADES_CACHE.update({"at": now, "sig": sig, "data": trades})
+    return list(trades)
 
 def num_or_none(v):
     if v is None or v == "":
@@ -695,8 +711,15 @@ def market_window_label(start_ts, end_ts=None):
         return ""
 
 def load_windows(limit=200):
+    fp = TRUE_DIR / "windows.jsonl"
+    now = time.time()
+    sig = file_sig(fp)
+    key = int(limit)
+    cached = WINDOWS_CACHE.get(key)
+    if cached and cached.get("sig") == sig and now - cached.get("at", 0) < 5:
+        return list(cached.get("data", []))
     rows_by_slug = {}
-    for row in tail_jsonl(TRUE_DIR / "windows.jsonl", max(limit * 8, 600)):
+    for row in tail_jsonl(fp, max(limit * 8, 600)):
         slug = row.get("slug")
         start = row.get("window_start_ts")
         if not slug or not start:
@@ -706,15 +729,25 @@ def load_windows(limit=200):
         rows_by_slug[slug] = merged
     rows = list(rows_by_slug.values())
     rows.sort(key=lambda r: int(r.get("window_start_ts") or 0), reverse=True)
-    return rows[:limit]
+    result = rows[:limit]
+    WINDOWS_CACHE[key] = {"at": now, "sig": sig, "data": result}
+    return list(result)
 
 def resolution_by_slug(limit=5000):
+    fp = TRUE_DIR / "resolutions.jsonl"
+    now = time.time()
+    sig = file_sig(fp)
+    key = int(limit)
+    cached = RESOLUTION_CACHE.get(key)
+    if cached and cached.get("sig") == sig and now - cached.get("at", 0) < 60:
+        return dict(cached.get("data", {}))
     out = {}
-    for row in tail_jsonl(TRUE_DIR / "resolutions.jsonl", limit):
+    for row in tail_jsonl(fp, limit):
         slug = row.get("slug")
         if slug:
             out[slug] = row
-    return out
+    RESOLUTION_CACHE[key] = {"at": now, "sig": sig, "data": out}
+    return dict(out)
 
 def resolution_final(row):
     row = row if isinstance(row, dict) else {}
@@ -1398,8 +1431,6 @@ class H(SimpleHTTPRequestHandler):
     def do_fund_trend(self):
         """返回资金变化趋势数据"""
         trades = read_trades()
-        resolutions = resolution_by_slug(5000)
-        resolutions = resolution_by_slug(5000)
         # 按时间排序
         trades.sort(key=lambda t: t.get("time", ""))
         
