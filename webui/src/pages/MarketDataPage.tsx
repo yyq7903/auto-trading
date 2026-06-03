@@ -52,6 +52,17 @@ export default function MarketDataPage({ markets, integrity }: Props) {
 
   const market = markets[selected];
 
+  const changePage = (nextPage: number) => {
+    const bounded = Math.max(1, Math.min(totalPages || 1, nextPage));
+    setPage(bounded);
+    setSelected((bounded - 1) * PAGE_SIZE);
+  };
+
+  useEffect(() => {
+    if (!markets.length) return;
+    if (selected >= markets.length) setSelected(0);
+  }, [markets.length, selected]);
+
   // Fetch real tick data when market changes
   useEffect(() => {
     if (!market?.slug) return;
@@ -194,9 +205,9 @@ export default function MarketDataPage({ markets, integrity }: Props) {
           </table>
         </div>
         <div className="pagination">
-          <button className="page-btn" onClick={() => setPage(Math.max(1, page - 1))} disabled={page <= 1}>‹</button>
+          <button className="page-btn" onClick={() => changePage(page - 1)} disabled={page <= 1}>‹</button>
           <span style={{ fontSize: 10, color: "var(--muted)", margin: "0 8px" }}>{page}/{totalPages}</span>
-          <button className="page-btn" onClick={() => setPage(Math.min(totalPages, page + 1))} disabled={page >= totalPages}>›</button>
+          <button className="page-btn" onClick={() => changePage(page + 1)} disabled={page >= totalPages}>›</button>
         </div>
       </div>
       <div className="card" style={{ flex: 1, display: "flex", flexDirection: "column" }}>

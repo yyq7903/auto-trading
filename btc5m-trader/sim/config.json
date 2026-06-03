@@ -1,69 +1,92 @@
 {
-  "paused": false,
+  "paused": true,
+  "armed": false,
   "entry_second": 25,
-  "gap_threshold": 10,
-  "min_buy_price": 0.6,
-  "bet_fraction": 1.0,
+  "gap_threshold": 20,
+  "min_buy_price": 0.95,
+  "bet_mode": "fixed_amount",
+  "fixed_bet_amount": 1.0,
+  "bet_fraction": 0.0,
+  "max_live_amount": 1.0,
   "withdraw_mode": "none",
   "max_consecutive_losses": 5,
   "cooldown_seconds": 0,
-  "initial_capital": 1.0,
-  "active_strategy": "1",
+  "initial_capital": 10.0,
+  "active_strategy": "3",
   "strategies": {
     "1": {
-      "name": "策略一（默认）",
+      "name": "槽位1：旧宽松观察",
       "win_rate": 95.4,
       "params": {
         "entry_second": 25,
-        "gap_threshold": 10,
+        "gap_threshold": 15,
         "min_buy_price": 0.6,
-        "bet_fraction": 1,
+        "bet_mode": "fixed_amount",
+        "fixed_bet_amount": 1.0,
+        "bet_fraction": 0.0,
         "cooldown_seconds": 0
-      }
+      },
+      "description": "历史槽位，暂不作为当前模拟主策略。"
     },
     "2": {
-      "name": "策略二（早段极端动量）",
+      "name": "槽位2：早段极端波动观察",
       "win_rate": 100.0,
       "params": {
         "entry_second": 120,
         "gap_threshold": 120,
         "min_buy_price": 0.7,
-        "bet_fraction": 0.5,
+        "bet_mode": "fixed_amount",
+        "fixed_bet_amount": 1.0,
+        "bet_fraction": 0.0,
         "cooldown_seconds": 0
-      }
+      },
+      "description": "观察 120 秒窗口的大幅价差信号，样本和真实成交可行性不足，暂不实盘。"
     },
     "3": {
-      "name": "策略三（中段趋势延续）",
-      "win_rate": 99.7,
+      "name": "主推：T25 P95 gap20 固定1元",
+      "win_rate": 99.26,
+      "backtest_date": "2026-06-03",
       "params": {
-        "entry_second": 60,
-        "gap_threshold": 60,
-        "min_buy_price": 0.65,
-        "bet_fraction": 0.75,
+        "entry_second": 25,
+        "gap_threshold": 20,
+        "min_buy_price": 0.95,
+        "bet_mode": "fixed_amount",
+        "fixed_bet_amount": 1.0,
+        "bet_fraction": 0.0,
         "cooldown_seconds": 0
-      }
+      },
+      "description": "当前最值得小额实盘验证的保守策略：T25内，买入概率95%-99%，买入差>=20，固定1元。合并新旧模拟流筛选后269笔267胜2负，固定1元折算10元到约13.17，最大回撤约-1.88；仍不是盈利保证，实盘需观察成交率和滑点。"
     },
     "4": {
-      "name": "策略四（盘口确认）",
-      "win_rate": 99.2,
+      "name": "观察：T25 P95 gap0 固定1元",
+      "win_rate": 98.84,
+      "backtest_date": "2026-06-02",
       "params": {
-        "entry_second": 45,
-        "gap_threshold": 30,
-        "min_buy_price": 0.62,
-        "bet_fraction": 0.5,
+        "entry_second": 25,
+        "gap_threshold": 0,
+        "min_buy_price": 0.95,
+        "bet_mode": "fixed_amount",
+        "fixed_bet_amount": 1.0,
+        "bet_fraction": 0.0,
         "cooldown_seconds": 0
-      }
+      },
+      "description": "机会更多的高概率对照策略：T25内，概率>=95%，不要求买入差。旧模拟信号约259笔256胜3负，收益略低且更容易吃到小价差反转，暂不作为首个实盘主策略。"
     },
     "5": {
-      "name": "策略五（末秒高置信）",
-      "win_rate": 98.9,
+      "name": "激进观察：T25 P95 比例10%",
+      "win_rate": 98.84,
+      "backtest_date": "2026-06-02",
       "params": {
-        "entry_second": 15,
-        "gap_threshold": 25,
-        "min_buy_price": 0.75,
-        "bet_fraction": 0.25,
+        "entry_second": 25,
+        "gap_threshold": 0,
+        "min_buy_price": 0.95,
+        "bet_mode": "fraction",
+        "fixed_bet_amount": 1.0,
+        "bet_fraction": 0.1,
         "cooldown_seconds": 0
-      }
+      },
+      "description": "同样P95信号但按余额10%下注。回测收益略高但回撤更大，小本金受1元最低下注限制，实盘前只作观察，不建议现在启用。"
     }
-  }
+  },
+  "mode": "sim"
 }

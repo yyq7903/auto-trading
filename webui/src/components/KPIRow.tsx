@@ -50,7 +50,8 @@ export default function KPIRow({ summary, fundTrend, marketStats }: Props) {
   const s = summary || {};
   const simBankroll = s.sim_bankroll ?? (s as any).stats_sim_bankroll ?? 0;
   const liveBankroll = s.live_bankroll ?? (s as any).stats_live_bankroll ?? 0;
-  const simReturn = simBankroll > 0 ? ((simBankroll - 1) * 100).toFixed(1) : "0";
+  const simInitial = fundTrend?.initial && fundTrend.initial > 0 ? fundTrend.initial : 10;
+  const simReturn = simBankroll > 0 ? (((simBankroll - simInitial) / simInitial) * 100).toFixed(1) : "0";
   const today = s.daily_summary?.[0];
   const todayPnl = today?.pnl ?? 0;
   const todayWins = today?.wins ?? 0;

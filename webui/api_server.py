@@ -566,7 +566,16 @@ def svc(n):
         return cached.get("ok", False)
     try:
         if os.name == "nt":
-            r = subprocess.run(["wsl","bash","-lc",f"ps -ef | grep -F '{n}' | grep -v grep"],capture_output=True,text=True,encoding="utf-8",errors="ignore",timeout=1)
+            r = subprocess.run(["wsl","systemctl","--user","is-active",n],capture_output=True,text=True,encoding="utf-8",errors="ignore",timeout=1)
+            if r.stdout.strip()=="active":
+                SERVICE_CACHE[n] = {"at": now, "ok": True}
+                return True
+            hint = {
+                "btc5m-sim":"sim/trader.py", "btc5m-sim.service":"sim/trader.py",
+                "btc5m-live":"live/trader.py", "btc5m-live.service":"live/trader.py",
+                "btc5m-collector":"true_market_collector.py", "btc5m-collector.service":"true_market_collector.py",
+            }.get(n, n)
+            r = subprocess.run(["wsl","bash","-lc",f"ps -ef | grep -F '{hint}' | grep -v grep"],capture_output=True,text=True,encoding="utf-8",errors="ignore",timeout=1)
             ok = bool(r.stdout.strip())
             SERVICE_CACHE[n] = {"at": now, "ok": ok}
             return ok
@@ -600,6 +609,19 @@ def clh():
     global LH, LH_at
     now = time.time()
     if now-LH_at<60: return LH
+    def _wsl_health():
+        if os.name != "nt":
+            return None
+        cmd = "cd /mnt/c/Users/yyq/Desktop/自动交易/btc5m-trader && python3 -m clob_executor health"
+        try:
+            r = subprocess.run(["wsl", "bash", "-lc", cmd], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=6)
+            out = (r.stdout or "").strip()
+            start = out.find("{")
+            if start >= 0:
+                return json.loads(out[start:])
+            return {"executor":"clob_sdk","ok":False,"error":(r.stderr or out or "wsl_health_empty")[:300]}
+        except Exception as e:
+            return {"executor":"clob_sdk","ok":False,"error":str(e)[:300]}
     try:
         import clob_executor
         import threading
@@ -611,12 +633,12 @@ def clh():
                 result[0] = {"executor":"clob_sdk","ok":False,"error":str(e)[:300]}
         t = threading.Thread(target=_run, daemon=True)
         t.start()
-        t.join(timeout=1)
+        t.join(timeout=4)
         if t.is_alive():
             LH = {"executor":"clob_sdk","ok":False,"error":"health_check_timeout"}; LH_at=now; return LH
         LH = result[0]; LH_at=now; return LH
     except Exception as e:
-        LH = {"executor":"clob_sdk","ok":False,"error":str(e)[:300]}; LH_at=now; return LH
+        LH = _wsl_health() or {"executor":"clob_sdk","ok":False,"error":str(e)[:300]}; LH_at=now; return LH
 
 def read_trades():
     fp = D / "trades.jsonl"
@@ -1318,80 +1340,6 @@ class H(SimpleHTTPRequestHandler):
                 "skip_reason":t.get("skip_reason",""),
             })
 
-        # 如果是第一页，检查当前窗口是否有交易记录，没有则添加"进行中"虚拟记录
-        if page == 1:
-            snap = true_market_snapshot()
-            current_slug = snap.get("slug", "")
-            current_start = snap.get("window_start_ts", 0)
-            current_end = snap.get("window_end_ts", 0)
-            seconds_left = snap.get("seconds_left", 0)
-
-            if current_slug and seconds_left > 0:
-                # 检查是否已有当前窗口的记录
-                has_current = any(
-                    t.get("slug") == current_slug or t.get("market_slug") == current_slug
-                    for t in all_trades[:50]  # 只检查最近50条
-                )
-                if not has_current:
-                    # 添加虚拟"进行中"记录
-                    btc_price = snap.get("btc_price", 0) or snap.get("chainlink_price", 0)
-                    ptb = snap.get("ptb", 0) or snap.get("open_price", 0)
-                    gap = round(btc_price - ptb, 2) if btc_price and ptb else 0
-                    direction = "up" if gap > 0 else "down" if gap < 0 else "none"
-                    up_price = snap.get("up_price", 0)
-                    down_price = snap.get("down_price", 0)
-                    prob = up_price if gap > 0 else down_price if gap < 0 else 0
-
-                    now = datetime.now(CN)
-                    start_dt = datetime.fromtimestamp(current_start, CN)
-                    end_dt = datetime.fromtimestamp(current_end, CN)
-                    market_time = f"{start_dt.strftime('%m-%d %H:%M')}-{end_dt.strftime('%H:%M')}"
-
-                    virtual_record = {
-                        "status": "active",
-                        "time": now.isoformat(),
-                        "entry_time": int(time.time()),
-                        "entry_seconds_before": None,
-                        "direction": direction,
-                        "settlement_direction": "",
-                        "mode": "sim",
-                        "slug": current_slug,
-                        "market_slug": current_slug,
-                        "window_start_ts": current_start,
-                        "window_end_ts": current_end,
-                        "market_time": market_time,
-                        "btc_open": round(ptb, 2),
-                        "platform_open_price": round(ptb, 2) if ptb else None,
-                        "btc_entry": round(btc_price, 2),
-                        "btc_final": None,
-                        "platform_close_price": None,
-                        "entry_gap": gap,
-                        "buy_gap": gap,
-                        "settle_gap": None,
-                        "settlement_gap": None,
-                        "close_gap": None,
-                        "buy_prob": round(prob, 3),
-                        "entry_probability": round(prob, 3),
-                        "probability_source": "realtime",
-                        "probability_age_seconds": None,
-                        "best_bid": None,
-                        "best_ask": None,
-                        "avg_fill_price": None,
-                        "fill_quality": None,
-                        "buy_amount": 0,
-                        "fee": None,
-                        "amount": 0,
-                        "net_profit": 0,
-                        "pnl": 0,
-                        "return_pct": 0,
-                        "settlement_status": "active",
-                        "settle_source": "",
-                        "settle_confirmed_at": None,
-                        "exclude_from_backtest": False,
-                        "skip_reason": f"进行中 剩余{seconds_left}s",
-                    }
-                    fmt.insert(0, virtual_record)
-
         self.j({"trades":fmt,"total":actual_total,"page":page,"pages":pages,"per_page":pp})
     def do_daily_detail(self):
         trades=read_trades()
@@ -1749,21 +1697,37 @@ class H(SimpleHTTPRequestHandler):
         import subprocess
         act=b.get("action","start"); mode=b.get("mode","sim")
         if mode == "live" and act == "start":
-            lc=rj(LC); lc["paused"]=True; lc["armed"]=False; wj(LC,lc)
-            self.j({"error":"实盘单笔下单已经验证成功；自动循环还没有接进主程序，所以系统保持实盘暂停，避免继续真实下注。"},409); return
+            if b.get("confirm","")!="BTC5M-LIVE":
+                self.j({"error":"启动实盘需要输入确认词 BTC5M-LIVE"},400); return
+            ch=clh()
+            bal = ch.get("balance_allowance", {}) if isinstance(ch.get("balance_allowance"), dict) else {}
+            route_ready = bool(ch.get("ok") and ch.get("signature_type")==3 and usd6(bal.get("balance",0)) >= 1)
+            if not route_ready:
+                self.j({"error":"实盘路线未就绪：CLOB pUSD 余额不足 1 美元或接口未通过健康检查","clob_health":ch},409); return
         fp = SC if mode == "sim" else LC
         cfg=rj(fp); cfg["paused"]=(act=="pause")
         if mode == "live":
-            cfg["armed"] = False
+            cfg["armed"] = (act=="start")
+            cfg["max_live_amount"] = min(float(b.get("max_live_amount", cfg.get("max_live_amount", 1.0)) or 1.0), 1.0)
         wj(fp,cfg)
         root=rj(T/"config.json"); root["mode"]=mode; root["paused"]=cfg.get("paused",True); wj(T/"config.json",root)
+        other_fp = LC if mode == "sim" else SC
+        other = rj(other_fp)
+        other["paused"] = True
+        if other_fp == LC:
+            other["armed"] = False
+        wj(other_fp, other)
         
         # 启动/停止 systemd 服务
         service_name = f"btc5m-{mode}.service"
+        other_service_name = "btc5m-live.service" if mode == "sim" else "btc5m-sim.service"
         service_action = "stop" if act == "pause" else "start"
         try:
+            stop_cmd = ["wsl","systemctl","--user","stop",other_service_name] if os.name == "nt" else ["systemctl","--user","stop",other_service_name]
+            subprocess.run(stop_cmd, capture_output=True, text=True, timeout=2)
+            cmd = ["wsl","systemctl","--user",service_action,service_name] if os.name == "nt" else ["systemctl","--user",service_action,service_name]
             result = subprocess.run(
-                ["systemctl", "--user", service_action, service_name],
+                cmd,
                 capture_output=True, text=True, timeout=2
             )
             service_started = result.returncode == 0
@@ -1774,8 +1738,9 @@ class H(SimpleHTTPRequestHandler):
         
         # 检查服务状态
         try:
+            status_cmd = ["wsl","systemctl","--user","is-active",service_name] if os.name == "nt" else ["systemctl","--user","is-active",service_name]
             status_result = subprocess.run(
-                ["systemctl", "--user", "is-active", service_name],
+                status_cmd,
                 capture_output=True, text=True, timeout=2
             )
             service_active = status_result.stdout.strip() == "active"

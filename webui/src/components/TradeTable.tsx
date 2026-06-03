@@ -44,11 +44,11 @@ export default function TradeTable({ trades, total, mode }: Props) {
     });
   }, [trades, filters]);
 
-  const totalPages = Math.ceil(filtered.length / tpp);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / tpp));
   const pageData = useMemo(() => {
     const start = (page - 1) * tpp;
     return filtered.slice(start, start + tpp);
-  }, [filtered, page]);
+  }, [filtered, page, tpp]);
 
   const exportCSV = () => {
     const header = "status,mode,time,dir,open,btc,settle,gap,settle_gap,result,prob,amount,fee,entry,pnl,ret,skip";

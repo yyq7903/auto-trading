@@ -14,11 +14,14 @@ interface BackendStrategies {
   active_strategy: string;
   strategies: Record<string, {
     name: string;
+    description?: string;
     win_rate: number;
     params: {
       entry_second: number;
       gap_threshold: number;
       min_buy_price: number;
+      bet_mode?: string;
+      fixed_bet_amount?: number;
       bet_fraction: number;
       cooldown_seconds: number;
     };
@@ -26,15 +29,17 @@ interface BackendStrategies {
 }
 
 function backendToFrontendSlot(s: BackendStrategies["strategies"][string]): StrategySlot {
+  const fixedAmount = s.params.bet_mode === "fixed_amount" || s.params.bet_mode === "amount";
   return {
     name: s.name,
+    description: s.description,
     entry: s.params.entry_second,
     gap: s.params.gap_threshold,
     prob: s.params.min_buy_price,
     cool: s.params.cooldown_seconds,
     dir: "both",
-    fund: "fixed",
-    fundParam: s.params.bet_fraction,
+    fund: fixedAmount ? "amount" : "fixed",
+    fundParam: fixedAmount ? (s.params.fixed_bet_amount ?? 1) : s.params.bet_fraction,
   };
 }
 
@@ -259,7 +264,14 @@ export default function App() {
   const toggleLive = useCallback(async () => {
     const action = liveOn ? "pause" : "start";
     try {
-      await api.toggle(action, "live");
+      const options: Record<string, string | number> = {};
+      if (action === "start") {
+        const confirmText = window.prompt("实盘会使用真实余额下单。请输入 BTC5M-LIVE 确认启动：");
+        if (confirmText !== "BTC5M-LIVE") return;
+        options.confirm = confirmText;
+        options.max_live_amount = 1;
+      }
+      await api.toggle(action, "live", options);
       setLiveOn(!liveOn);
       if (!liveOn) setSimOn(false);
     } catch (e) {
@@ -284,7 +296,9 @@ export default function App() {
         entry_second: nextSlot.entry,
         gap_threshold: nextSlot.gap,
         min_buy_price: nextSlot.prob,
-        bet_fraction: nextSlot.fundParam,
+        bet_mode: nextSlot.fund === "amount" ? "fixed_amount" : "fraction",
+        fixed_bet_amount: nextSlot.fund === "amount" ? nextSlot.fundParam : 1,
+        bet_fraction: nextSlot.fund === "fixed" ? nextSlot.fundParam : 0,
         cooldown_seconds: nextSlot.cool,
       });
     } catch (e) {

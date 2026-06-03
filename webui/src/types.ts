@@ -1,5 +1,6 @@
 export interface StrategySlot {
   name: string;
+  description?: string;
   entry: number;
   gap: number;
   prob: number;

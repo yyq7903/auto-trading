@@ -52,12 +52,31 @@ export default function StrategyPanel({ slots, activeSlots, onToggleSlot, onUpda
               >
                 <span>策略 {n}</span>
                 <b>{cleanName(slots[n].name)}</b>
+                {slots[n].description ? (
+                  <small title={slots[n].description}>
+                    {slots[n].description.length > 30 ? `${slots[n].description.slice(0, 30)}...` : slots[n].description}
+                  </small>
+                ) : null}
               </button>
             ))}
           </div>
           <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8 }}>
             当前后端执行策略：<span style={{ color: "var(--text)", fontWeight: 700 }}>{firstActive ? cleanName(firstActive.name) : "未选择"}</span>
           </div>
+          {firstActive?.description ? (
+            <div style={{
+              fontSize: 11,
+              color: "var(--text)",
+              padding: "7px 9px",
+              background: "rgba(59,130,246,.08)",
+              border: "1px solid rgba(59,130,246,.24)",
+              borderRadius: 6,
+              marginBottom: 10,
+              lineHeight: 1.5,
+            }}>
+              {firstActive.description}
+            </div>
+          ) : null}
           <div className="params-grid">
             <div className="param">
               <div className="k">入场窗口</div>

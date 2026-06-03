@@ -1,11 +1,11 @@
-"""
+﻿"""
 BTC 5M 共享工具
 """
 import json, time
 from datetime import datetime, timezone, timedelta
 
 CN = timezone(timedelta(hours=8))
-DATA_BASE = "/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据"
+DATA_BASE = "C:/Users/yyq/Desktop/自动交易/btc5m数据"
 
 
 def log(msg, mode="sim", tag=""):

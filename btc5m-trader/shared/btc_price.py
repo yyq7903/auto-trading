@@ -1,7 +1,7 @@
-"""
+﻿"""
 BTC 价格获取 — Chainlink RPC
 """
-import time, json, requests, threading
+import time, json, requests, threading, os, os, os, os, os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -9,9 +9,10 @@ CHAINLINK_RPC = "https://polygon-bor-rpc.publicnode.com"
 CHAINLINK_CONTRACT = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 CHAINLINK_SIG = "0xfeaf968c"
 GAMMA_API = "https://gamma-api.polymarket.com"
-DATA_DIR = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/shared")
+DATA_DIR = Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/shared") if os.name == "nt" else Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/shared" if os.name == "nt" else "C:/Users/yyq/Desktop/自动交易/btc5m数据/shared" if os.name == "nt" else "C:/Users/yyq/Desktop/自动交易/btc5m数据/shared" if os.name == "nt" else "C:/Users/yyq/Desktop/自动交易/btc5m数据/shared" if os.name == "nt" else "/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/shared")
 MARKETS_FILE = DATA_DIR / "markets.jsonl"
 BTC_PRICE_FILE = DATA_DIR / "btc_price.jsonl"
+TRUE_DIR = Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/true_market") if os.name == "nt" else Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/true_market" if os.name == "nt" else "C:/Users/yyq/Desktop/自动交易/btc5m数据/true_market" if os.name == "nt" else "C:/Users/yyq/Desktop/自动交易/btc5m数据/true_market" if os.name == "nt" else "C:/Users/yyq/Desktop/自动交易/btc5m数据/true_market" if os.name == "nt" else "/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/true_market")
 
 _btc_cache = None
 _btc_lock = threading.Lock()
@@ -28,7 +29,7 @@ def get_btc() -> float:
 
 
 def get_btc_fresh(retries=3) -> float:
-    """从Chainlink获取实时BTC价格"""
+    """从Chainlink获取实时BTC价格；RPC受限时回退到Coinbase现货价。"""
     for i in range(retries):
         try:
             r = requests.post(CHAINLINK_RPC, json={
@@ -46,7 +47,33 @@ def get_btc_fresh(retries=3) -> float:
         except Exception as e:
             if i < retries - 1:
                 time.sleep(1)
-    return 0.0
+    for url, parser in (
+        ("https://api.exchange.coinbase.com/products/BTC-USD/ticker", lambda data: data.get("price")),
+        ("https://api.coinbase.com/v2/prices/BTC-USD/spot", lambda data: (data.get("data") or {}).get("amount")),
+    ):
+        try:
+            r = requests.get(url, timeout=3)
+            if r.status_code != 200:
+                continue
+            price = float(parser(r.json()) or 0)
+            if price > 0:
+                with _btc_lock:
+                    _btc_cache = price
+                return price
+        except Exception:
+            pass
+    try:
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=3)
+        if r.status_code == 200:
+            amount = ((r.json().get("data") or {}).get("amount"))
+            price = float(amount or 0)
+            if price > 0:
+                with _btc_lock:
+                    _btc_cache = price
+                return price
+    except Exception:
+        pass
+    return _btc_cache or 0.0
 
 
 def btc_price_loop():
@@ -80,6 +107,19 @@ def fetch_ptb(slug: str) -> float:
                     break
 
     if ptb <= 0:
+        for row in reversed(read_jsonl_tail(TRUE_DIR / "windows.jsonl", 600)):
+            if row.get("slug") != slug:
+                continue
+            if row.get("source") == "platform_validation":
+                ptb = float(row.get("platform_ptb", 0) or 0)
+                if ptb > 0:
+                    break
+            if row.get("source") == "polymarket_gamma":
+                ptb = float(row.get("ptb", 0) or 0)
+                if ptb > 0:
+                    break
+
+    if ptb <= 0:
         return 0.0
 
     _ptb_cache[slug] = ptb
@@ -108,11 +148,85 @@ def read_jsonl_tail(path: Path, limit: int = 500) -> list:
 
 
 def latest_market_snapshot(slug: str) -> dict:
-    """Latest collector snapshot for BTC/market probabilities."""
-    for row in reversed(read_jsonl_tail(BTC_PRICE_FILE, 900)):
+    """Latest collector snapshot for BTC/market probabilities.
+
+    Priority: orderbook_ticks.jsonl (best bid/ask) > price_change_ticks.jsonl > price_ticks.jsonl
+    """
+    # 1) BTC price from price_ticks
+    price_row = {}
+    for row in reversed(read_jsonl_tail(TRUE_DIR / "price_ticks.jsonl", 1200)):
         if row.get("slug") == slug:
-            return row
-    return {}
+            price_row = row
+            break
+
+    # 2) Orderbook from orderbook_ticks (most reliable source with nested up/down)
+    ob_row = {}
+    for row in reversed(read_jsonl_tail(TRUE_DIR / "orderbook_ticks.jsonl", 200)):
+        if row.get("slug") == slug and isinstance(row.get("up"), dict) and isinstance(row.get("down"), dict):
+            ob_row = row
+            break
+
+    # 3) If orderbook has data, use it directly
+    if ob_row and ob_row.get("up") and ob_row.get("down"):
+        up_data = ob_row["up"]
+        down_data = ob_row["down"]
+        up_bid = float(up_data.get("bid1_price", 0) or 0)
+        up_ask = float(up_data.get("ask1_price", 0) or 0)
+        down_bid = float(down_data.get("bid1_price", 0) or 0)
+        down_ask = float(down_data.get("ask1_price", 0) or 0)
+        value = float(price_row.get("value", 0) or 0) if price_row else 0
+        return {
+            "chainlink_price": value,
+            "up_price": round((up_bid + up_ask) / 2, 4) if up_bid > 0 else up_ask,
+            "down_price": round((down_bid + down_ask) / 2, 4) if down_bid > 0 else down_ask,
+            "up_bid": up_bid,
+            "up_ask": up_ask,
+            "down_bid": down_bid,
+            "down_ask": down_ask,
+            "market_data_source": "orderbook_ticks",
+            "timestamp": ob_row.get("received_at") or ob_row.get("server_ts") or "",
+            "value": value,
+        }
+
+    # 4) Fallback to price_change_ticks
+    changes = {}
+    for row in reversed(read_jsonl_tail(TRUE_DIR / "price_change_ticks.jsonl", 1600)):
+        if row.get("slug") != slug:
+            continue
+        side = str(row.get("side", "")).lower()
+        if side in ("up", "down") and side not in changes:
+            changes[side] = {
+                "bid1_price": float(row.get("best_bid", 0) or 0),
+                "ask1_price": float(row.get("best_ask", 0) or 0),
+                "received_at": row.get("received_at", ""),
+            }
+        if "up" in changes and "down" in changes:
+            break
+
+    if not changes:
+        return price_row or {}
+
+    def side_prices(side_data: dict) -> dict:
+        bid = float(side_data.get("bid1_price", 0) or 0)
+        ask = float(side_data.get("ask1_price", 0) or 0)
+        mid = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else ask or bid or 0
+        return {"bid": bid, "ask": ask, "mid": mid}
+
+    up = side_prices(changes.get("up", {}))
+    down = side_prices(changes.get("down", {}))
+    value = float(price_row.get("value", 0) or 0)
+    return {
+        **price_row,
+        "chainlink_price": value,
+        "up_price": up["mid"],
+        "down_price": down["mid"],
+        "up_bid": up["bid"],
+        "up_ask": up["ask"],
+        "down_bid": down["bid"],
+        "down_ask": down["ask"],
+        "market_data_source": "true_market",
+        "timestamp": price_row.get("received_at") or price_row.get("server_ts") or "",
+    }
 
 
 def extract_tokens(market):
@@ -141,10 +255,14 @@ def extract_tokens(market):
 
 
 def find_market(markets, slug: str) -> dict:
-    """在市场列表中查找指定slug"""
+    """在市场列表中查找指定slug，回退到 true_market/windows.jsonl"""
     for m in markets:
         if m.get("slug") == slug:
             return m
+    # 回退：从 true_market/windows.jsonl 获取 token 信息
+    for row in reversed(read_jsonl_tail(TRUE_DIR / "windows.jsonl", 200)):
+        if row.get("slug") == slug and row.get("source") == "polymarket_gamma":
+            return row
     return {}
 
 

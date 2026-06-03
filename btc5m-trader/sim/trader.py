@@ -29,6 +29,7 @@ MARKETS_FILE = COLLECTOR_DATA / "markets.jsonl"
 TRUE_MARKET_DIR = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/true_market")
 WINDOWS_FILE = TRUE_MARKET_DIR / "windows.jsonl"
 ORDERBOOK_TICKS_FILE = TRUE_MARKET_DIR / "orderbook_ticks.jsonl"
+DATA_QUALITY_FILE = TRUE_MARKET_DIR / "data_quality.jsonl"
 
 # === 运行时状态 ===
 config = Config(str(TRADER_DIR))
@@ -158,7 +159,7 @@ def load_markets() -> list:
 
 
 def fetch_ptb(slug: str) -> float:
-    """从 true_market/windows.jsonl 获取 PTB（取最后一条有效记录）"""
+    """从 true_market/windows.jsonl 获取已验证 PTB（取最后一条有效记录）"""
     best_ptb = 0.0
     try:
         if WINDOWS_FILE.exists():
@@ -173,7 +174,15 @@ def fetch_ptb(slug: str) -> float:
                         src = d.get("source", "")
                         if src not in ("polymarket_gamma", "ptb_retry_fill", "platform_validation"):
                             continue
-                        ptb = d.get("ptb") or d.get("platform_ptb") or d.get("our_ptb") or 0
+                        if src == "platform_validation":
+                            ptb = d.get("platform_ptb") or 0
+                            diff = parse_float(d.get("diff"), 999999)
+                            if diff > 1:
+                                continue
+                        else:
+                            if d.get("ptb_quality") != "platform" or d.get("exclude_from_backtest"):
+                                continue
+                            ptb = d.get("ptb") or 0
                         if ptb and float(ptb) > 0:
                             best_ptb = float(ptb)
                     except:
@@ -209,6 +218,17 @@ def parse_float(v, default=0.0):
         return float(v)
     except:
         return default
+
+
+def calc_bet_size(current_bankroll: float) -> float:
+    """Return a realistic simulated stake. Fixed $1 is the current baseline."""
+    mode = str(cfg.get("bet_mode", "fraction") or "fraction")
+    if mode in ("amount", "fixed_amount"):
+        target = parse_float(cfg.get("fixed_bet_amount", 1.0), 1.0)
+    else:
+        target = current_bankroll * parse_float(cfg.get("bet_fraction", 1.0), 1.0)
+    target = max(1.0, target)
+    return round(min(target, max(1.0, current_bankroll)), 6)
 
 
 def fetch_platform_open_cached(window_start_ts: int, window_end_ts: int) -> float:
@@ -255,6 +275,33 @@ def tail_jsonl(path: Path, n=300):
         return []
 
 
+def latest_data_quality(slug: str) -> dict:
+    for row in reversed(tail_jsonl(DATA_QUALITY_FILE, 200)):
+        if row.get("slug") == slug:
+            return row
+    return {}
+
+
+def data_quality_allows_entry(slug: str, current_5m: int) -> tuple[bool, str]:
+    q = latest_data_quality(slug)
+    if not q:
+        return False, "数据质量缺失"
+    if q.get("current_market_slug") != slug:
+        return False, "采集器市场未同步"
+    if int(q.get("current_window_start_ts") or 0) != int(current_5m):
+        return False, "采集器窗口时间不匹配"
+    if not q.get("token_ids_ready"):
+        return False, "市场token未就绪"
+    if not q.get("clob_ws_online"):
+        return False, "盘口WebSocket离线"
+    orderbook_age = parse_float(q.get("last_orderbook_tick_age_ms"), 999999)
+    if abs(orderbook_age) > 3000:
+        return False, f"盘口延迟{orderbook_age:.0f}ms"
+    if q.get("ptb_pending"):
+        return False, "平台开盘价待确认"
+    return True, ""
+
+
 def _side_quote(side_data: dict, sim_data: dict | None = None):
     side_data = side_data if isinstance(side_data, dict) else {}
     bids = side_data.get("bids", []) if isinstance(side_data.get("bids"), list) else []
@@ -269,8 +316,9 @@ def _side_quote(side_data: dict, sim_data: dict | None = None):
     sim_data = sim_data if isinstance(sim_data, dict) else {}
     avg_fill = parse_float(sim_data.get("simulated_avg_fill_price"), 0)
     fill_quality = sim_data.get("fill_quality", "")
-    # 只用模拟成交均价或 ask 作为概率。ask=0 意味着没有卖单，不能成交
-    probability = avg_fill if avg_fill > 0 and fill_quality in ("full", "partial") else 0
+    # Live-oriented simulation: a signal is tradable only if a full $1 market
+    # buy can be filled from the current orderbook.
+    probability = avg_fill if avg_fill > 0 and fill_quality == "full" else 0
     return {
         "probability": probability,
         "bid": bid,
@@ -278,10 +326,12 @@ def _side_quote(side_data: dict, sim_data: dict | None = None):
         "mid": mid,
         "avg_fill": avg_fill,
         "fill_quality": fill_quality,
+        "available_liquidity_at_entry": parse_float(sim_data.get("available_liquidity_at_entry"), 0),
+        "slippage_vs_best_ask": parse_float(sim_data.get("slippage_vs_best_ask"), 0),
     }
 
 
-def latest_entry_quote(slug: str, direction: str, max_age_seconds=15):
+def latest_entry_quote(slug: str, direction: str, max_age_seconds=3):
     """取入场时最新盘口概率，避免使用市场开盘 outcome_prices。"""
     side_key = "up" if direction.lower() == "up" else "down"
     sim_key = f"{side_key}_sim"
@@ -304,26 +354,8 @@ def latest_entry_quote(slug: str, direction: str, max_age_seconds=15):
             continue
         if isinstance(row.get(side_key), dict) and isinstance(row.get(sim_key), dict):
             quote = _side_quote(row.get(side_key), row.get(sim_key))
-            if quote["probability"] > 0 and quote.get("fill_quality") in ("full", "partial"):
+            if quote["probability"] > 0 and quote.get("fill_quality") == "full":
                 quote["source"] = row.get("reason", "orderbook_snapshot")
-                quote["age_seconds"] = round(age, 3) if age is not None else None
-                return quote
-    # 第二遍：slug不匹配时fallback到最新任意slug的盘口（Gamma API挂掉时用）
-    for row in cache_rows[:100]:
-        if row.get("reason") not in allowed_reasons:
-            continue
-        age = None
-        try:
-            ts = datetime.fromisoformat(str(row.get("received_at") or row.get("server_ts") or "").replace("Z", "+00:00"))
-            age = (now - ts).total_seconds()
-        except:
-            pass
-        if age is not None and age > max_age_seconds:
-            continue
-        if isinstance(row.get(side_key), dict) and isinstance(row.get(sim_key), dict):
-            quote = _side_quote(row.get(side_key), row.get(sim_key))
-            if quote["probability"] > 0 and quote.get("fill_quality") in ("full", "partial"):
-                quote["source"] = f"slug_mismatch_{row.get('slug','')[-6:]}"
                 quote["age_seconds"] = round(age, 3) if age is not None else None
                 return quote
     return {"probability": 0, "source": "missing_orderbook", "age_seconds": None}
@@ -335,7 +367,7 @@ def _slug_exists_in_trades(slug):
     """检查trades.jsonl中是否已有该slug的记录"""
     try:
         if ROOT_TRADES.exists():
-            with open(ROOT_TRADES, "r") as f:
+            with open(ROOT_TRADES, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     if slug in line:
                         return True
@@ -384,6 +416,8 @@ def record_skip(slug, reason, current_5m, btc_price=0, ptb=0, gap=0, buy_price=0
         "best_ask": quote.get("ask"),
         "avg_fill_price": quote.get("avg_fill"),
         "fill_quality": quote.get("fill_quality"),
+        "available_liquidity_at_entry": quote.get("available_liquidity_at_entry"),
+        "slippage_vs_best_ask": quote.get("slippage_vs_best_ask"),
         "amount": 0,
         "pnl": 0,
         "return": 0,
@@ -401,7 +435,7 @@ def record_skip(slug, reason, current_5m, btc_price=0, ptb=0, gap=0, buy_price=0
     }
     log_trade(record, MODE)
     try:
-        with open(ROOT_TRADES, "a") as f:
+        with open(ROOT_TRADES, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except:
         pass
@@ -428,7 +462,7 @@ def settle_old_records():
     try:
         if not ROOT_TRADES.exists():
             return
-        with open(ROOT_TRADES, "r") as f:
+        with open(ROOT_TRADES, "r", encoding="utf-8-sig") as f:
             lines = f.readlines()
         
         updated = False
@@ -477,7 +511,7 @@ def settle_old_records():
                 log(f"⚠️ 结算价获取失败 {record.get('slug')}: {e}", MODE)
         
         if updated:
-            with open(ROOT_TRADES, "w") as f:
+            with open(ROOT_TRADES, "w", encoding="utf-8") as f:
                 f.writelines(lines)
     except Exception as e:
         log(f"⚠️ 结算扫描错误: {e}", MODE)
@@ -595,6 +629,17 @@ def main():
             monitor["window_seconds"] = entry_window_seconds
             monitor["evaluations"] = int(monitor.get("evaluations", 0)) + 1
 
+            quality_ok, quality_reason = data_quality_allows_entry(slug, current_5m)
+            if not quality_ok:
+                monitor["last_reason"] = f"数据异常：{quality_reason}"
+                if remaining <= 1:
+                    log(f"⏭ {slug} {monitor['last_reason']} 跳过", MODE, tag="SIM")
+                    record_skip(slug, monitor["last_reason"], current_5m, monitor=monitor)
+                    processed.add(slug)
+                    monitor_state.pop(slug, None)
+                time.sleep(0.1)
+                continue
+
             # 加载市场
             markets = load_markets()
 
@@ -609,20 +654,6 @@ def main():
                 if ptb <= 0:
                     ptb_source = "collector_fallback"
                     ptb = fetch_ptb(slug)
-                if ptb <= 0:
-                    m = find_market(markets, slug)
-                    ptb = float(m.get("priceToBeat", 0))
-                if ptb <= 0:
-                    # API全挂时用窗口开始时的BTC价格作为最后fallback
-                    ptb_source = "btc_fallback"
-                    window_start_btc = monitor.get("window_start_btc", 0)
-                    if window_start_btc > 0:
-                        ptb = window_start_btc
-                    else:
-                        ptb = get_btc()
-                        monitor["window_start_btc"] = ptb
-                    if ptb > 0:
-                        log(f"⚠️ PTB API全挂，用窗口BTC: ${ptb:,.2f}", MODE, tag="SIM")
                 if ptb > 0:
                     monitor["ptb"] = ptb
                     monitor["ptb_source"] = ptb_source
@@ -645,13 +676,13 @@ def main():
 
             # 计算方向和概率
             direction = "Up" if gap > 0 else "Down"
-            quote = latest_entry_quote(slug, direction, max_age_seconds=15)
+            quote = latest_entry_quote(slug, direction, max_age_seconds=3)
             buy_price = quote.get("probability", 0) or 0
 
             # 如果当前方向概率太低（< min_buy_price），尝试反向
             if False and buy_price > 0 and buy_price < cfg["min_buy_price"]:
                 reverse_dir = "Down" if direction == "Up" else "Up"
-                reverse_quote = latest_entry_quote(slug, reverse_dir, max_age_seconds=15)
+                reverse_quote = latest_entry_quote(slug, reverse_dir, max_age_seconds=3)
                 reverse_price = reverse_quote.get("probability", 0) or 0
                 if reverse_price > buy_price and reverse_price > cfg["min_buy_price"]:
                     log(f"🔄 {slug} {direction}概率{buy_price:.0%}太低，改买{reverse_dir}概率{reverse_price:.0%}", MODE, tag="SIM")
@@ -762,7 +793,12 @@ def main():
             btc_price = entry_btc_price
             ptb = entry_open_price
             gap = entry_gap
-            bet_size = bankroll * cfg["bet_fraction"]
+            initial_capital = max(1.0, float(cfg.get("initial_capital", 1.0)))
+            if bankroll < 1.0:
+                bankroll = initial_capital
+                consecutive_losses = 0
+                log(f"🔄 模拟资金低于平台最低下注额，自动重置为 ${initial_capital:.2f}", MODE, tag="SIM")
+            bet_size = calc_bet_size(bankroll)
             log(f"🎯 {slug} {direction} gap=${gap:+,.0f} @{buy_price:.3f} 下注${bet_size:.2f} T-{entry_seconds_before}s", MODE, tag="SIM")
 
             # 模拟结果：从 Polymarket 平台获取官方结算价
@@ -803,7 +839,12 @@ def main():
                     "best_ask": quote.get("ask"),
                     "avg_fill_price": quote.get("avg_fill"),
                     "fill_quality": quote.get("fill_quality"),
+                    "available_liquidity_at_entry": quote.get("available_liquidity_at_entry"),
+                    "slippage_vs_best_ask": quote.get("slippage_vs_best_ask"),
                     "amount": bet_size,
+                    "bet_mode": cfg.get("bet_mode", "fraction"),
+                    "fixed_bet_amount": cfg.get("fixed_bet_amount", 1.0),
+                    "bet_fraction": cfg.get("bet_fraction", 1.0),
                     "pnl": None,
                     "return": None,
                     "settlement_status": "pending",
@@ -821,7 +862,7 @@ def main():
                 log_trade(record, MODE)
                 if not _slug_exists_in_trades(slug):
                     try:
-                        with open(ROOT_TRADES, "a") as f:
+                        with open(ROOT_TRADES, "a", encoding="utf-8") as f:
                             f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     except:
                         pass
@@ -845,12 +886,12 @@ def main():
                 loss_count += 1
                 consecutive_losses += 1
                 log(f"❌ 亏损! -${loss:.2f} 余额=${bankroll:.2f}", MODE, tag="SIM")
-                # 亏损后自动重置为配置的初始资金
-                if bankroll <= 0:
-                    initial = float(cfg.get("initial_capital", 1.0))
+                # 亏损后低于平台最低下注额时，自动重置为配置的初始资金
+                if bankroll < 1.0:
+                    initial = max(1.0, float(cfg.get("initial_capital", 1.0)))
                     bankroll = initial
                     consecutive_losses = 0
-                    log(f"🔄 资金归零，自动重置为 ${initial:.2f}", MODE, tag="SIM")
+                    log(f"🔄 模拟资金低于平台最低下注额，自动重置为 ${initial:.2f}", MODE, tag="SIM")
 
             trade_count += 1
 
@@ -883,7 +924,12 @@ def main():
                 "best_ask": quote.get("ask"),
                 "avg_fill_price": quote.get("avg_fill"),
                 "fill_quality": quote.get("fill_quality"),
+                "available_liquidity_at_entry": quote.get("available_liquidity_at_entry"),
+                "slippage_vs_best_ask": quote.get("slippage_vs_best_ask"),
                 "amount": bet_size,
+                "bet_mode": cfg.get("bet_mode", "fraction"),
+                "fixed_bet_amount": cfg.get("fixed_bet_amount", 1.0),
+                "bet_fraction": cfg.get("bet_fraction", 1.0),
                 "pnl": round(profit if won else -loss, 2),
                 "return": round((profit if won else -loss) / bet_size, 4),
                 "settlement_status": "confirmed",
@@ -901,7 +947,7 @@ def main():
             log_trade(record, MODE)
             if not _slug_exists_in_trades(slug):
                 try:
-                    with open(ROOT_TRADES, "a") as f:
+                    with open(ROOT_TRADES, "a", encoding="utf-8") as f:
                         f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 except:
                     pass

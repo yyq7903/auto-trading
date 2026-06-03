@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 BTC 5M Live Trader — browser Magic-session execution
 完全隔离：独立 config / state / trades / logs
@@ -12,18 +12,18 @@ from dotenv import load_dotenv
 from shared.utils import log, log_trade, CN
 from shared.config import Config
 from shared.btc_price import get_btc, get_btc_fresh, btc_price_loop, fetch_ptb, extract_tokens, find_market, latest_market_snapshot, fetch_platform_crypto_price
-import browser_executor
+import clob_executor
 
 load_dotenv()
 
 # === 路径 ===
 MODE = "live"
 TRADER_DIR = Path(__file__).parent
-DATA_DIR = Path(f"/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/{MODE}")
+DATA_DIR = Path(f"C:/Users/yyq/Desktop/自动交易/btc5m数据/{MODE}")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # WebUI 读取的根目录 trades.jsonl
-ROOT_TRADES = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/trades.jsonl")
+ROOT_TRADES = Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/trades.jsonl")
 
 STATE_FILE = DATA_DIR / "state.json"
 NOTIFY_FILE = DATA_DIR / "notify.txt"
@@ -33,7 +33,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", "0x23D779628967Db6D8896031a8Cdf739A9273d201")
 
 # === 数据目录（共享，只读） ===
-COLLECTOR_DATA = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/shared")
+COLLECTOR_DATA = Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/shared")
 MARKETS_FILE = COLLECTOR_DATA / "markets.jsonl"
 BTC_PRICE_FILE = COLLECTOR_DATA / "btc_price.jsonl"
 
@@ -102,11 +102,33 @@ def save_state():
     config.save_state(state)
     # 同时写入根目录 trader_state.json 供 WebUI 读取
     try:
-        root_state = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据/trader_state.json")
+        root_state = Path("C:/Users/yyq/Desktop/自动交易/btc5m数据/trader_state.json")
         with open(root_state, "w") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
     except:
         pass
+
+
+def parse_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except:
+        return default
+
+
+def calc_bet_size(current_bankroll: float) -> float:
+    """Live path mirrors sim staking, then caps by max_live_amount."""
+    min_order_amount = 1.0
+    mode = str(cfg.get("bet_mode", "fraction") or "fraction")
+    if mode in ("amount", "fixed_amount"):
+        target = parse_float(cfg.get("fixed_bet_amount", 1.0), 1.0)
+    else:
+        target = current_bankroll * parse_float(cfg.get("bet_fraction", 1.0), 1.0)
+    max_live_amount = parse_float(cfg.get("max_live_amount", 1.0), 1.0)
+    target = max(min_order_amount, target)
+    return round(min(target, max_live_amount, max(min_order_amount, current_bankroll)), 6)
 
 
 # === BTC 价格 ===
@@ -162,7 +184,7 @@ def check_signal(markets, slug, now, current_5m):
         snap_age = time.time() - snap_time.timestamp()
     except:
         snap_age = 999
-    if snap_age > 30:
+    if snap_age > 15:
         r = current_5m + 300 - now
         record_skip(slug, f"数据太旧{snap_age:.0f}s", r)
         return None
@@ -224,9 +246,15 @@ def live_ready_to_trade() -> tuple[bool, str]:
         return False, "live 配置已暂停"
     if not cfg.get("armed", False):
         return False, "live 未人工武装"
-    executor_ready = browser_executor.check_ready()
+    health = clob_executor.health(check_auth=True)
+    balance_payload = health.get("balance_allowance", {}) if isinstance(health, dict) else {}
+    try:
+        collateral_balance = float(balance_payload.get("balance", 0) or 0) / 1_000_000
+    except Exception:
+        collateral_balance = 0.0
+    executor_ready = bool(health.get("ok") and collateral_balance >= 1.0)
     if not executor_ready:
-        return False, "浏览器 Magic 执行器未就绪"
+        return False, f"CLOB SDK未就绪或pUSD余额不足1美元(balance=${collateral_balance:.2f})"
     return True, "ready"
 
 
@@ -238,17 +266,17 @@ def main():
     log("=" * 50, MODE)
     log("BTC 5M LIVE TRADER", MODE)
     log(f"钱包: {FUNDER_ADDRESS[:10]}...{FUNDER_ADDRESS[-6:]}", MODE)
-    log("执行层: Browser Magic Session", MODE)
+    log("执行层: backend CLOB SDK", MODE)
     log("=" * 50, MODE)
 
     # 加载配置和状态
     config.load()
     load_state()
 
-    # 检查浏览器 Magic 登录态执行器
-    executor_ready = browser_executor.check_ready()
+    # 检查后端 CLOB 执行器；真实下单仍由 paused/armed/balance 三重闸门控制。
+    executor_ready = clob_executor.check_ready()
     if not executor_ready:
-        log("⚠️ 浏览器 Magic 执行器不可用！继续运行，但不会真实下单", MODE)
+        log("⚠️ CLOB SDK 执行器不可用！继续运行，但不会真实下单", MODE)
 
     # 启动价格线程
     threading.Thread(target=btc_update_loop, daemon=True).start()
@@ -322,8 +350,7 @@ def main():
             # 计算下注
             min_order_amount = 1.0  # Market order minimum on the Polymarket UI.
             max_live_amount = float(cfg.get("max_live_amount", 1.0))
-            bet_size = max(bankroll * cfg["bet_fraction"], min_order_amount)
-            bet_size = min(bet_size, max_live_amount)
+            bet_size = calc_bet_size(bankroll)
             if bet_size < min_order_amount:
                 log(f"⏭ 最低下单金额${min_order_amount:.2f} > 单笔上限${max_live_amount:.2f}", MODE, tag="LIVE")
                 record_skip(slug, f"最低下单金额${min_order_amount:.2f}>上限${max_live_amount:.2f}", remaining)
@@ -338,12 +365,21 @@ def main():
             ready, ready_reason = live_ready_to_trade()
             result = {}
             if ready:
-                log(f"[Browser] 🚀 市价下单: {direction} ${bet_size:.2f} token={sig['token_id'][:10]}...", MODE)
-                result = browser_executor.place_order(direction, bet_size, slug)
+                order_type = str(cfg.get("live_order_type", "FAK") or "FAK").upper()
+                log(f"[CLOB] 市价下单: {direction} ${bet_size:.2f} token={sig['token_id'][:10]}...", MODE)
+                result = clob_executor.place_market_order(
+                    direction=direction,
+                    amount=bet_size,
+                    slug=slug,
+                    token_id=sig["token_id"],
+                    max_order_amount=max_live_amount,
+                    order_type=order_type,
+                    dry_run=False,
+                )
                 if result.get("success"):
-                    log(f"[Browser] ✅ 下单成功: {result.get('status', '')} {result.get('orderID', '')}", MODE)
+                    log(f"[CLOB] 下单成功: {result.get('status', '')} {result.get('orderID', '')}", MODE)
                 else:
-                    log(f"[Browser] ❌ 下单失败: {result.get('error', 'unknown')}", MODE)
+                    log(f"[CLOB] 下单失败: {result.get('error', 'unknown')}", MODE)
             else:
                 log(f"⏭ {ready_reason}，跳过真实下单", MODE)
                 record_skip(slug, ready_reason, remaining)
@@ -359,12 +395,15 @@ def main():
                 "ptb": round(sig["ptb"], 2),
                 "buy_price": buy_price,
                 "buy_amount": round(bet_size, 2),
+                "bet_mode": cfg.get("bet_mode", "fraction"),
+                "fixed_bet_amount": cfg.get("fixed_bet_amount", 1.0),
+                "bet_fraction": cfg.get("bet_fraction", 1.0),
                 "size": size,
                 "data_age": round(sig.get("data_age", 0), 3),
                 "market_data_source": sig.get("market_data_source", ""),
                 "orderID": result.get("orderID", ""),
                 "status": (result.get("status") or "placed") if result.get("success") else ("failed" if ready else "skipped"),
-                "executor": "browser_magic" if ready else "none",
+                "executor": result.get("executor", "clob_sdk") if ready else "none",
                 "skip_reason": "" if result.get("success") else (result.get("error") or result.get("errorMsg") or ready_reason),
                 "executor_result": result,
             }

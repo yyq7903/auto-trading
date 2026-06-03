@@ -135,12 +135,15 @@ interface BackendStrategies {
   active_strategy: string;
   strategies: Record<string, {
     name: string;
+    description?: string;
     win_rate: number;
     backtest_date: string;
     params: {
       entry_second: number;
       gap_threshold: number;
       min_buy_price: number;
+      bet_mode?: string;
+      fixed_bet_amount?: number;
       bet_fraction: number;
       cooldown_seconds: number;
     };
@@ -391,13 +394,13 @@ export const api = {
   fundTrend: () => request<BackendFundTrend>("/api/fund-trend"),
   skipReasons: () => request<BackendSkipReasons>("/api/skip-reasons"),
 
-  toggle: (action: "start" | "pause", mode: "sim" | "live") =>
-    request("/api/toggle", { method: "POST", body: JSON.stringify({ action, mode }) }),
+  toggle: (action: "start" | "pause", mode: "sim" | "live", options: Record<string, string | number> = {}) =>
+    request("/api/toggle", { method: "POST", body: JSON.stringify({ action, mode, ...options }) }),
 
   switchStrategy: (id: string) =>
     request("/api/strategies/switch", { method: "POST", body: JSON.stringify({ strategy_id: id }) }),
 
-  updateStrategy: (id: string, name: string, params: Record<string, number>) =>
+  updateStrategy: (id: string, name: string, params: Record<string, number | string>) =>
     request("/api/strategies/update", { method: "POST", body: JSON.stringify({ strategy_id: id, name, params }) }),
 
   setSimFunds: (amount: number) =>

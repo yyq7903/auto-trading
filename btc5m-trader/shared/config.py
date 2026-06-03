@@ -11,6 +11,8 @@ DEFAULT_CONFIG = {
     "entry_second": 25,
     "gap_threshold": 10,
     "min_buy_price": 0.60,
+    "bet_mode": "fraction",
+    "fixed_bet_amount": 1.0,
     "bet_fraction": 1.0,
     "max_live_amount": 1.0,
     "withdraw_mode": "none",
@@ -23,27 +25,27 @@ DEFAULT_STRATEGIES = {
     "1": {
         "name": "策略一（默认）",
         "win_rate": 95.4,
-        "params": {"entry_second": 25, "gap_threshold": 10, "min_buy_price": 0.60, "bet_fraction": 1.0, "cooldown_seconds": 0},
+        "params": {"entry_second": 25, "gap_threshold": 10, "min_buy_price": 0.60, "bet_mode": "fraction", "fixed_bet_amount": 1.0, "bet_fraction": 1.0, "cooldown_seconds": 0},
     },
     "2": {
         "name": "策略二（早段极端动量）",
         "win_rate": 100.0,
-        "params": {"entry_second": 120, "gap_threshold": 120, "min_buy_price": 0.70, "bet_fraction": 0.5, "cooldown_seconds": 0},
+        "params": {"entry_second": 120, "gap_threshold": 120, "min_buy_price": 0.70, "bet_mode": "fraction", "fixed_bet_amount": 1.0, "bet_fraction": 0.5, "cooldown_seconds": 0},
     },
     "3": {
         "name": "策略三（中段趋势延续）",
         "win_rate": 99.7,
-        "params": {"entry_second": 60, "gap_threshold": 60, "min_buy_price": 0.65, "bet_fraction": 0.75, "cooldown_seconds": 0},
+        "params": {"entry_second": 60, "gap_threshold": 60, "min_buy_price": 0.65, "bet_mode": "fraction", "fixed_bet_amount": 1.0, "bet_fraction": 0.75, "cooldown_seconds": 0},
     },
     "4": {
         "name": "策略四（盘口确认）",
         "win_rate": 99.2,
-        "params": {"entry_second": 45, "gap_threshold": 30, "min_buy_price": 0.62, "bet_fraction": 0.5, "cooldown_seconds": 0},
+        "params": {"entry_second": 45, "gap_threshold": 30, "min_buy_price": 0.62, "bet_mode": "fraction", "fixed_bet_amount": 1.0, "bet_fraction": 0.5, "cooldown_seconds": 0},
     },
     "5": {
         "name": "策略五（末秒高置信）",
         "win_rate": 98.9,
-        "params": {"entry_second": 15, "gap_threshold": 25, "min_buy_price": 0.75, "bet_fraction": 0.25, "cooldown_seconds": 0},
+        "params": {"entry_second": 15, "gap_threshold": 25, "min_buy_price": 0.75, "bet_mode": "fraction", "fixed_bet_amount": 1.0, "bet_fraction": 0.25, "cooldown_seconds": 0},
     },
 }
 
@@ -81,6 +83,8 @@ class Config:
             "entry_second": self.data["entry_second"],
             "gap_threshold": self.data["gap_threshold"],
             "min_buy_price": self.data["min_buy_price"],
+            "bet_mode": self.data.get("bet_mode", "fraction"),
+            "fixed_bet_amount": self.data.get("fixed_bet_amount", 1.0),
             "bet_fraction": self.data["bet_fraction"],
             "max_live_amount": self.data.get("max_live_amount", 1.0),
             "withdraw_mode": self.data["withdraw_mode"],

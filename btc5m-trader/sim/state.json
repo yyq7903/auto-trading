@@ -1,8 +1,8 @@
 {
-  "bankroll": 1.0101010101010102,
-  "trade_count": 265,
-  "win_count": 247,
-  "loss_count": 18,
+  "bankroll": 11.068901836865564,
+  "trade_count": 85,
+  "win_count": 84,
+  "loss_count": 1,
   "total_withdrawn": 0.0,
   "consecutive_losses": 0,
   "cooldown_until": 0

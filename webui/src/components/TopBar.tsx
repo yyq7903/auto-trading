@@ -87,7 +87,7 @@ export default function TopBar({
           disabled={liveStartBlocked}
           title={liveStartBlocked ? "实盘路线未就绪，已禁止从页面启动真实交易" : undefined}
         >
-          {liveOn ? "暂停实盘" : liveStartBlocked ? "实盘未就绪" : "启动实盘"}
+          {liveOn ? "暂停实盘" : "启动实盘"}
         </button>
         <button className="btn" onClick={onRefresh}>刷新</button>
       </div>

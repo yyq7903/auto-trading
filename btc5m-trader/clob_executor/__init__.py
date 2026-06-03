@@ -1,4 +1,4 @@
-"""
+﻿"""
 Official Polymarket CLOB SDK executor.
 
 This replaces brittle browser-click execution with signed CLOB v2 orders.
@@ -26,7 +26,7 @@ from py_clob_client_v2 import (
 
 
 TRADER_ROOT = Path(__file__).resolve().parents[1]
-DATA_ROOT = Path("/mnt/c/Users/yyq/Desktop/自动交易/btc5m数据")
+DATA_ROOT = Path("C:/Users/yyq/Desktop/自动交易/btc5m数据")
 MARKETS_FILE = DATA_ROOT / "shared" / "markets.jsonl"
 
 load_dotenv(TRADER_ROOT / ".env")
